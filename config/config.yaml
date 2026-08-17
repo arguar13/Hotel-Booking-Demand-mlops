@@ -1,0 +1,18 @@
+data:
+  raw_data_path: "data/hotel_bookings.csv"
+  processed_data_path: "data/processed_hotel_bookings.csv"
+  valid_classes_min_count: 10
+
+model:
+  target_column: "market_segment"
+  test_size: 0.2
+  random_state: 42
+  n_trials_optuna: 2
+
+mlflow:
+  experiment_name: "hotel_market_segmentation"
+  tracking_uri: "http://localhost:5000"
+
+api:
+  host: "0.0.0.0"
+  port: 8000

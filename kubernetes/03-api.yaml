@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+      annotations:
+        # El pod de la API necesita leer el modelo de MLflow/S3
+        eks.amazonaws.com/role-arn: arn:aws:iam::REDACTED_ACCOUNT_ID:role/ApiS3AccessRole
+    spec:
+      serviceAccountName: api-sa
+      containers:
+        - name: api
+          image: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: mlops-secrets
+            - configMapRef:
+                name: mlops-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: LoadBalancer
