@@ -16,3 +16,5 @@ psycopg2-binary==2.9.9 # Fundamental para conectarse a Amazon RDS (PostgreSQL)
 
 setuptools==70.0.0
 wheel
+starlette==0.27.0
+httpx==0.24.1
