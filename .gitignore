@@ -1,0 +1,39 @@
+# Entornos virtuales
+venv/
+env/
+.env
+
+# Archivos compilados y cache de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+junit/
+
+# DVC (Data Version Control)
+# Ignoramos todo el contenido pero mantenemos la estructura de la carpeta
+# DVC (Data Version Control)
+/data/*
+!/data/.gitkeep
+!*.dvc
+!/data/.gitignore
+
+/models/*
+!/models/.gitkeep
+!/models/*.dvc
+!/models/.gitignore
+
+.dvc/config.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+creds.json
+creds.sh
+creds.json
+creds.sh
+mlflow.db
+mlruns/
