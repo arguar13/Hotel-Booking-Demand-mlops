@@ -31,7 +31,7 @@ jobs:
     - name: Install Dependencies & Run Tests
       run: |
         python -m pip install --upgrade pip
-        pip install setuptools wheel
+        pip install setuptools==70.0.0 wheel
         pip install pytest httpx
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         export PYTHONPATH=$PYTHONPATH:$(pwd)
