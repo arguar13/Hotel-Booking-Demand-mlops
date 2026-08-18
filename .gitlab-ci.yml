@@ -70,8 +70,8 @@ deploy-eks:
     - mv kubectl /usr/local/bin/
     - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
     - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
-    - sed -i "s|image:\ hotel-mlops-api.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_API:latest|g" kubernetes/05-api.yaml
-    - sed -i "s|image:\ hotel-mlops-dashboard.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest|g" kubernetes/06-dashboard.yaml
+    - sed -i "s|image:\ hotel-mlops-api.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_API:latest|g" kubernetes/03-api.yaml
+    - sed -i "s|image:\ hotel-mlops-dashboard.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest|g" kubernetes/04-dashboard.yaml
     - kubectl apply -f kubernetes/
   rules:
     - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
