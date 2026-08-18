@@ -1,5 +1,6 @@
 import pandas as pd
 import mlflow.sklearn
+from mlflow.tracking import MlflowClient
 from fastapi import FastAPI, HTTPException
 from api.schemas import BookingFeatures
 import logging
@@ -21,7 +22,7 @@ model = None
 @app.on_event("startup")
 def load_model():
     """
-    Loads the model from MLflow (local dev) or from DVC local artifact (production).
+    Loads the model from MLflow (Cloud Registry) or falls back to local artifact.
     """
     global model
 
@@ -29,15 +30,27 @@ def load_model():
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-service:5000"))
 
     try:
-        # Intento 1: MLflow Model Registry (Entorno Local)
+        # Intento 1: MLflow Model Registry de forma dinámica (Compatible con MLflow 2.10+)
         model_name = "HotelSegmentClassifier"
-        model_uri = f"models:/{model_name}/latest"
+        client = MlflowClient()
+        
+        # Buscar todas las versiones del modelo registrado
+        versions = client.search_model_versions(f"name='{model_name}'")
+        if not versions:
+            raise Exception(f"No versions found for model {model_name}")
+        
+        # Obtener la versión numérica más alta (ej: versión 4)
+        latest_version = max(int(v.version) for v in versions)
+        model_uri = f"models:/{model_name}/{latest_version}"
+        
+        logger.info(f"Loading model from MLflow URI: {model_uri}")
         model = mlflow.sklearn.load_model(model_uri)
         logger.info("Model loaded successfully from MLflow.")
+        
     except Exception as e:
-        logger.warning(f"MLflow not reachable ({e}). Falling back to local DVC model.")
+        logger.warning(f"MLflow not reachable or model not found ({e}). Falling back to local DVC model.")
         try:
-            # Intento 2: Archivo local (Entorno Cloud Run / Producción)
+            # Intento 2: Archivo local (Producción o respaldo)
             model_path = os.getenv("MODEL_PATH", "models/model.joblib")
             model = joblib.load(model_path)
             logger.info("Model loaded successfully from local file.")
