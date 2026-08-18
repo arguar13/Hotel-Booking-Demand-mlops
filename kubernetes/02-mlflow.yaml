@@ -14,7 +14,7 @@ spec:
       # Best practice: Service Account con acceso a S3 (IRSA)
       annotations:
         # Con el número de cuenta AWS
-        eks.amazonaws.com/role-arn: arn:aws:iam::REDACTED_ACCOUNT_ID:role/MLflowS3AccessRole
+        eks.amazonaws.com/role-arn: arn:aws:iam::REDACTED_ACCOUNT_ID:role/eksctl-hotel-mlops-cluster-addon-iamserviceac-Role1-wbf9IH11mql5
     spec:
       serviceAccountName: mlflow-sa 
       containers:

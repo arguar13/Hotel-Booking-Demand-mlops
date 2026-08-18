@@ -59,24 +59,19 @@ build-push-ecr:
 
 deploy-eks:
   stage: deploy
-  image: amazon/aws-cli:latest
+  image:
+    name: amazon/aws-cli:latest
+    entrypoint: [""]  # <- Esta es la línea mágica que soluciona el error
   <<: *aws_auth
   script:
     - yum install -y tar gzip
-    # Instalación de kubectl
     - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
     - chmod +x kubectl
     - mv kubectl /usr/local/bin/
-    
-    # Configuración del cluster EKS
     - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
-    
-    # Inyección de las nuevas imágenes en los manifiestos de la carpeta 'kubernetes/'
     - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - sed -i "s|image:\ hotel-mlops-api.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_API:latest|g" kubernetes/05-api.yaml
     - sed -i "s|image:\ hotel-mlops-dashboard.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest|g" kubernetes/06-dashboard.yaml
-    
-    # Despliegue en Kubernetes
     - kubectl apply -f kubernetes/
   rules:
     - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'

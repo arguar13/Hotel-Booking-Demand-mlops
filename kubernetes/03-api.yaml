@@ -13,7 +13,7 @@ spec:
         app: api
       annotations:
         # El pod de la API necesita leer el modelo de MLflow/S3
-        eks.amazonaws.com/role-arn: arn:aws:iam::REDACTED_ACCOUNT_ID:role/ApiS3AccessRole
+        eks.amazonaws.com/role-arn: arn:aws:iam::REDACTED_ACCOUNT_ID:role/eksctl-hotel-mlops-cluster-addon-iamserviceac-Role1-QvD192ncUIzr
     spec:
       serviceAccountName: api-sa
       containers:
