@@ -16,7 +16,7 @@ variables:
 .aws_auth: &aws_auth
   id_tokens:
     GITLAB_OIDC_TOKEN:
-      aud: https://gitlab.com
+      aud: sts.amazonaws.com
   before_script:
     - echo "$GITLAB_OIDC_TOKEN" > $AWS_WEB_IDENTITY_TOKEN_FILE
 
