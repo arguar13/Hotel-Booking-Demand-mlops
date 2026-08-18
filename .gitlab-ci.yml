@@ -1,0 +1,82 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  AWS_REGION: "us-east-1"
+  ECR_REPOSITORY_API: "hotel-mlops-api"
+  ECR_REPOSITORY_DASHBOARD: "hotel-mlops-dashboard"
+  EKS_CLUSTER_NAME: "hotel-mlops-cluster"
+  # ATENCIÓN: Actualiza este ARN con tu nuevo rol de IAM para GitLab
+  AWS_ROLE_ARN: "arn:aws:iam::REDACTED_ACCOUNT_ID:role/GitLabCIRole"
+  AWS_WEB_IDENTITY_TOKEN_FILE: "/tmp/web_identity_token"
+
+# Anclaje para la autenticación OIDC nativa de AWS con GitLab
+.aws_auth: &aws_auth
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: https://gitlab.com
+  before_script:
+    - echo "$GITLAB_OIDC_TOKEN" > $AWS_WEB_IDENTITY_TOKEN_FILE
+
+test-api:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - python -m pip install --upgrade pip
+    - pip install setuptools wheel
+    - pip install fastapi==0.103.2 starlette==0.27.0 httpx==0.24.1 pytest
+    - if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - export PYTHONPATH=$PYTHONPATH:$(pwd)
+    - pytest tests/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+build-push-ecr:
+  stage: build
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  <<: *aws_auth
+  script:
+    - apk add --no-cache aws-cli
+    - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+    - export IMAGE_TAG=$CI_COMMIT_SHA
+    
+    # Autenticación en Amazon ECR
+    - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+    
+    # Construcción y subida de la API
+    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_API:latest -f Dockerfile .
+    - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_API
+    
+    # Construcción y subida del Dashboard
+    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest -f Dockerfile.dashboard .
+    - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+
+deploy-eks:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  <<: *aws_auth
+  script:
+    - yum install -y tar gzip
+    # Instalación de kubectl
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl
+    - mv kubectl /usr/local/bin/
+    
+    # Configuración del cluster EKS
+    - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_REGION
+    
+    # Inyección de las nuevas imágenes en los manifiestos de la carpeta 'kubernetes/'
+    - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+    - sed -i "s|image:\ hotel-mlops-api.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_API:latest|g" kubernetes/05-api.yaml
+    - sed -i "s|image:\ hotel-mlops-dashboard.*|image:\ $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest|g" kubernetes/06-dashboard.yaml
+    
+    # Despliegue en Kubernetes
+    - kubectl apply -f kubernetes/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
