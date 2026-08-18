@@ -2,15 +2,17 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
+# Variable para ver los logs en tiempo real en Kubernetes
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 # Copiar e instalar dependencias
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# Copiar todo el código del proyecto (incluida la carpeta dashboard/)
+# Copiar todo el código del proyecto
 COPY . /app/
 
-# Exponer el puerto nativo de Streamlit
 EXPOSE 8501
 
-# Comando para ejecutar la app de Streamlit
 CMD ["streamlit", "run", "dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

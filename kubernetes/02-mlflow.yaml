@@ -19,20 +19,12 @@ spec:
       serviceAccountName: mlflow-sa 
       containers:
         - name: mlflow
-          # Usa la imagen de ECR o una pública oficial
+          # Usamos la imagen de ECR o una pública oficial
           image: ghcr.io/mlflow/mlflow:v2.10.0 
           command:
-            - "mlflow"
-            - "server"
-            - "--backend-store-uri"
-            - "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(DB_HOST):5432/$(POSTGRES_DB)"
-            - "--default-artifact-root"
-            # El bucle real
-            - "s3://hotel-mlops-artifacts-prod/mlflow"
-            - "--host"
-            - "0.0.0.0"
-            - "--port"
-            - "5000"
+            - "/bin/bash"
+            - "-c"
+            - "pip install --no-cache-dir psycopg2-binary==2.9
           ports:
             - containerPort: 5000
           envFrom:

@@ -18,3 +18,8 @@ setuptools==70.0.0
 wheel
 starlette==0.27.0
 httpx==0.24.1
+
+# Dashboard
+streamlit==1.32.0
+requests==2.31.0
+
