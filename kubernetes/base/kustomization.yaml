@@ -3,12 +3,22 @@ kind: Kustomization
 
 resources:
   - serviceaccounts.yaml
-  - configmap.yaml
   - secretstore.yaml
   - external-secret-db.yaml
   - mlflow.yaml
   - api.yaml
   - dashboard.yaml
+
+# Generated rather than declared as a plain resource, so its name carries a
+# hash of its contents. Kustomize rewrites the envFrom references in the
+# Deployments to the hashed name, which means editing a value here changes the
+# Deployment spec and therefore triggers a rollout. With a static ConfigMap,
+# `envFrom` values are only read at pod start, so a changed value silently
+# never reaches the running pods.
+configMapGenerator:
+  - name: mlops-config
+    envs:
+      - mlops-config.env
 
 labels:
   - pairs:

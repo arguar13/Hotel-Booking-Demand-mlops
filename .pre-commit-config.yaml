@@ -38,7 +38,13 @@ repos:
     rev: v1.5.0
     hooks:
       - id: detect-secrets
-        args: [--baseline, .secrets.baseline]
+        # --exclude-lines newTag: the image tags in
+        # kubernetes/overlays/production/kustomization.yaml are 40-char git
+        # SHAs, which the high-entropy-hex detector flags. Baselining one is
+        # pointless - CI's gitops-release job rewrites it with a new SHA on
+        # every build, so the next commit would be blocked again. An image tag
+        # is never a credential.
+        args: [--baseline, .secrets.baseline, --exclude-lines, 'newTag:']
         exclude: poetry\.lock$
 
   - repo: local
