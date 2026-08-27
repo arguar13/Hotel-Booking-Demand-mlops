@@ -23,6 +23,32 @@ def test_health_endpoint():
     assert "model_loaded" in data
 
 
+def test_ready_endpoint_is_503_without_a_model(monkeypatch):
+    """
+    /ready gates traffic, so it must fail while there is no model.
+
+    Regression test: readiness used to point at /health, which is 200
+    unconditionally. A replica that came up while MLflow was still starting
+    therefore joined the Service and answered every /predict with a 503, and
+    because /health stayed 200 Kubernetes never restarted it.
+    """
+    monkeypatch.setattr(main, "model", None)
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not_ready"
+
+
+def test_ready_endpoint_is_200_once_a_model_is_loaded(monkeypatch):
+    monkeypatch.setattr(main, "model", MagicMock())
+
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
 def test_predict_endpoint_structure():
     """
     Verifica que el endpoint /predict responda con el formato correcto
