@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ import mlflow.sklearn
 import pandas as pd
 import pybreaker
 import structlog
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, status
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -58,6 +59,12 @@ model = None
 # alias API rather than the classic (deprecated) stages API.
 MODEL_NAME = "HotelSegmentClassifier"
 MODEL_ALIAS = os.getenv("MODEL_REGISTRY_ALIAS", "staging")
+
+# How long to wait between attempts while there is still no model at all.
+MODEL_RETRY_SECONDS = float(os.getenv("MODEL_RETRY_SECONDS", "15"))
+# How often to re-read the alias once a model *is* loaded, to pick up a newly
+# promoted version without a pod restart. 0 disables that (load once and stop).
+MODEL_REFRESH_SECONDS = float(os.getenv("MODEL_REFRESH_SECONDS", "0"))
 
 # Publishing prediction events to Kafka is entirely optional: it is only
 # attempted when KAFKA_BOOTSTRAP_SERVERS is set, and a Kafka outage must
@@ -117,7 +124,53 @@ def load_model():
             "model_load_failed",
             model_uri=model_uri,
             error=str(e),
-            note="serving 503 until a model is promoted",
+            note="will keep retrying in the background; /ready stays 503 until it loads",
+        )
+
+
+@app.on_event("startup")
+async def start_model_loader() -> None:
+    """Keep trying to load the model for as long as there isn't one.
+
+    Without this, a single failed startup was permanent. Every rollout restarts
+    the api and mlflow Deployments at the same time, so the api routinely comes
+    up while the tracking server is still starting, exhausts the three bounded
+    attempts above, and then serves 503 forever - with /health returning 200 the
+    whole time, so Kubernetes sees a healthy pod and never restarts it. In
+    practice that meant every deploy left the API dead until someone noticed.
+
+    The retry loop below also picks up a newly promoted model version without a
+    pod restart, once MODEL_REFRESH_SECONDS is set.
+    """
+    if model is not None and MODEL_REFRESH_SECONDS <= 0:
+        return
+    asyncio.create_task(_model_loader_loop())
+
+
+async def _model_loader_loop() -> None:
+    global model
+
+    model_uri = f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
+    while True:
+        if model is None:
+            delay = MODEL_RETRY_SECONDS
+        elif MODEL_REFRESH_SECONDS > 0:
+            delay = MODEL_REFRESH_SECONDS
+        else:
+            return  # loaded, and refreshing is disabled - nothing left to do
+        await asyncio.sleep(delay)
+        try:
+            # to_thread: mlflow's loader is blocking, and this coroutine shares
+            # the event loop that serves requests.
+            loaded = await asyncio.to_thread(_load_model_with_retry, model_uri)
+        except Exception as e:
+            log.warning("model_load_retry_failed", model_uri=model_uri, error=str(e))
+            continue
+        was_missing = model is None
+        model = loaded
+        log.info(
+            "model_load_succeeded" if was_missing else "model_refreshed",
+            model_uri=model_uri,
         )
 
 
@@ -152,9 +205,12 @@ def load_kafka_producer():
 @app.get("/health")
 def health():
     """
-    Liveness/readiness probe target. `model_loaded=False` still returns 200 -
-    the process is healthy even when no model has been promoted yet - use
-    /predict's 503 to detect that specific condition.
+    Liveness probe target: is the process itself alive and serving?
+
+    Deliberately still 200 with `model_loaded=False`. A missing model is not a
+    reason to kill the container - the background loader is retrying, and a
+    restart would only make it start over. Readiness is what gates traffic; see
+    /ready.
     """
     return {
         "status": "ok",
@@ -162,6 +218,22 @@ def health():
         "model_alias": MODEL_ALIAS,
         "kafka_circuit_breaker_state": _kafka_breaker.current_state,
     }
+
+
+@app.get("/ready")
+def ready(response: Response):
+    """
+    Readiness probe target: can this replica actually answer /predict?
+
+    Returns 503 until a model is loaded, so Kubernetes keeps the pod out of the
+    Service's endpoints instead of load-balancing requests onto a replica that
+    can only answer 503. During a rollout that is the difference between a few
+    seconds of one replica serving and clients seeing real errors.
+    """
+    if model is None:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "not_ready", "reason": "model not loaded yet"}
+    return {"status": "ready", "model_alias": MODEL_ALIAS}
 
 
 @app.post("/predict")

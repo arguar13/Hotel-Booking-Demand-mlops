@@ -51,12 +51,21 @@ spec:
               mountPath: /tmp
             - name: home
               mountPath: /home/appuser
+          # Readiness and liveness answer different questions, so they point at
+          # different endpoints. /ready is 503 until a model is actually loaded,
+          # which keeps a replica out of the Service until it can serve real
+          # predictions - during a rollout, mlflow and api restart together, so
+          # the api is briefly up with no model. /health only reports that the
+          # process is alive: a missing model must not restart the container,
+          # because the background loader is already retrying and a restart
+          # would just reset that progress.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /health
