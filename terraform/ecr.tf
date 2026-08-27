@@ -9,10 +9,19 @@ locals {
 }
 
 resource "aws_ecr_repository" "this" {
-  for_each             = local.ecr_repositories
-  name                 = each.value
+  for_each = local.ecr_repositories
+  name     = each.value
+  # Ver la entrada AWS-0031 en .trivyignore para por que los tags son mutables.
   image_tag_mutability = "MUTABLE"
   force_delete         = true
+
+  # Escaneo de vulnerabilidades en cada push. Cierra el circulo con el job
+  # trivy-scan de CI: aquel analiza el codigo y los lockfiles antes de
+  # construir; esto analiza la imagen ya construida, incluidos los paquetes
+  # del sistema operativo base que el lockfile no cubre.
+  image_scanning_configuration {
+    scan_on_push = true
+  }
 }
 
 # Politica de retencion para ahorrar costos (mantiene solo las ultimas 30 imagenes)

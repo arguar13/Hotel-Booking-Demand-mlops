@@ -66,10 +66,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.mlflow
+    # --allowed-hosts: MLflow >=3 rejects any request whose Host header it does
+    # not recognise ("possible DNS rebinding attack"), and the default list is
+    # localhost + private IPs only. The api and dashboard containers reach this
+    # server as `mlflow`, a Docker service name, so it has to be listed here or
+    # every client call comes back 403.
     command: >
       mlflow server
       --backend-store-uri postgresql://mlops_user:mlops_password@db:5432/mlflow_db
       --default-artifact-root s3://mlflow-artifacts/
+      --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000
       --host 0.0.0.0 --port 5000
     environment:
       # Dummy credentials LocalStack accepts unconditionally; points MLflow's

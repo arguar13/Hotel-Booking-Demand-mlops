@@ -32,5 +32,12 @@ RUN poetry config virtualenvs.create false \
 
 COPY api/ ./api/
 
+# Serve as an unprivileged user. UID 1000 is fixed on purpose: it is what
+# kubernetes/base/api.yaml's securityContext (runAsUser/runAsNonRoot) expects,
+# and the kubelet rejects the pod if the image's user turns out to be root.
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

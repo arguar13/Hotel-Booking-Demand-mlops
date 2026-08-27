@@ -22,6 +22,19 @@ variable "vpc_cidr" {
   default     = "10.0.0.0/16"
 }
 
+variable "cluster_endpoint_public_access_cidrs" {
+  description = <<-EOT
+    Rangos CIDR que pueden alcanzar el endpoint publico de la API de EKS.
+    Por defecto abierto, porque el operador necesita kubectl desde una IP
+    domestica dinamica y CI NO usa el cluster (el despliegue es GitOps: ArgoCD
+    hace pull desde dentro). En un entorno real, restringelo a la IP de salida
+    de tu oficina/VPN, o pon cluster_endpoint_public_access = false en eks.tf y
+    accede via bastion. Ver AWS-0040/AWS-0041 en .trivyignore.
+  EOT
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
 variable "db_username" {
   description = "Usuario administrador de RDS PostgreSQL"
   type        = string

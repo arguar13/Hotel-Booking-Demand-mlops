@@ -173,7 +173,7 @@ def predict_segment(features: BookingFeatures):
         raise HTTPException(status_code=503, detail="Model is currently unavailable.")
 
     try:
-        input_data = pd.DataFrame([features.dict()])
+        input_data = pd.DataFrame([features.model_dump()])
         prediction = model.predict(input_data)
         predicted_segment = str(prediction[0])
     except Exception as e:
@@ -194,7 +194,7 @@ def _publish_prediction_event(features: BookingFeatures, predicted_segment: str)
         "timestamp": time.time(),
         "model_name": MODEL_NAME,
         "model_alias": MODEL_ALIAS,
-        "features": features.dict(),
+        "features": features.model_dump(),
         "predicted_market_segment": predicted_segment,
     }
     try:

@@ -20,15 +20,28 @@ pandera = "^0.20.4"
 structlog = "^26.1.0" # JSON logs (CloudWatch/ELK-friendly), same approach as api/
 
 # MLOps & Infraestructura
-mlflow = "==2.11.3" #[cite: 27]
-setuptools = "^75.0" # mlflow imports pkg_resources at runtime; not preinstalled in a bare venv
-dvc = {extras = ["s3"], version = "^3.48.0"} # ¡Restaurado! Sin conflictos de resolución[cite: 27]
-boto3 = "==1.34.62" #[cite: 27]
-psycopg2-binary = "==2.9.9" #[cite: 27]
+# Version floors, not exact pins: poetry.lock is what makes a build
+# reproducible, so pinning here too only blocks security patches. These
+# floors are the ones the `trivy fs` gate in .gitlab-ci.yml requires.
+mlflow = "^3.15.0"     # 2.11.3 carried 35 HIGH/CRITICAL CVEs; also pulls fixed
+                       # gunicorn/protobuf/pyarrow transitively
+setuptools = "^78.1.1" # mlflow imports pkg_resources at runtime; >=78.1.1 fixes CVE-2025-47273
+dvc = {extras = ["s3"], version = "^3.48.0"}
+boto3 = "^1.34.62"
+psycopg2-binary = "^2.9.9"
 
 # UI & Monitoreo
-streamlit = "==1.32.0" #[cite: 27]
-requests = "==2.31.0" #[cite: 27]
+streamlit = "^1.40.0"
+requests = "^2.32.0"
+
+# Transitive-only dependencies (pulled in by mlflow / streamlit / matplotlib),
+# declared here purely to raise their floor above known HIGH/CRITICAL CVEs.
+# Poetry has no separate constraints file, so an explicit entry is the
+# supported way to bound a transitive package. Drop these once the upstream
+# floors move past them.
+gunicorn = "^22.0.0"  # CVE-2024-1135 / CVE-2024-6827 (request smuggling)
+pillow = "^12.1.1"    # 13 CVEs in 10.4.0 (heap OOB write, several DoS paths)
+pyarrow = "^23.0.1"   # CVE-2026-25087 (use-after-free DoS)
 pydantic = "^2.0.0" # Permitimos la versión moderna para estas herramientas[cite: 27]
 
 [tool.poetry.group.dev.dependencies]

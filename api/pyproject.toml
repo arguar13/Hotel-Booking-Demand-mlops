@@ -7,22 +7,35 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
-fastapi = "==0.103.2"
-uvicorn = "==0.23.2"
-mlflow = "==2.11.3"
-pandas = "==2.1.1"
-numpy = "<2.0.0"
-pydantic = "^1.10.13"
-starlette = "==0.27.0"
-httpx = "==0.24.1"
+# Version floors, not exact pins: poetry.lock is what makes a build
+# reproducible, so pinning here too only blocks security patches. These
+# floors are the ones the `trivy fs` gate in .gitlab-ci.yml requires.
+fastapi = "^0.141.0"      # >=0.141 pulls starlette>=1.x (fixes its DoS CVEs)
+uvicorn = "^0.32.0"       # with httpx below, pulls h11>=0.16 (CVE-2025-43859, CRITICAL)
+mlflow = "^3.15.0"        # 2.11.3 carried 35 HIGH/CRITICAL CVEs; also pulls
+                          # fixed gunicorn/protobuf/pyarrow transitively
+pandas = ">=2.1.1"
+numpy = "<2.0.0"          # keep aligned with core_ml/pyproject.toml
+pydantic = "^2.9.0"       # v2 required by mlflow>=3; also aligns with core_ml
+httpx = "^0.27.0"
 scikit-learn = ">=1.4.0"
 imbalanced-learn = "^0.14.0" # <0.14 is incompatible with the resolved scikit-learn>=1.6/1.7
-setuptools = "^75.0" # mlflow imports pkg_resources at runtime; not preinstalled in a bare venv
+setuptools = "^78.1.1" # mlflow imports pkg_resources at runtime; >=78.1.1 fixes CVE-2025-47273
 kafka-python = "^2.0.2" # optional prediction-event producer, only active if KAFKA_BOOTSTRAP_SERVERS is set
 boto3 = "^1.34.62" # mlflow.sklearn.load_model needs this for its S3 artifact store client (s3:// model URIs) - IRSA in prod, LocalStack locally
 structlog = "^26.1.0"    # JSON logs (CloudWatch/ELK-friendly)
 tenacity = "^9.1.4"      # bounded retry with backoff for MLflow/Kafka connections
 pybreaker = "^1.4.1"     # circuit breaker around the Kafka publish path
+
+# Transitive-only dependencies (pulled in by mlflow), declared here purely to
+# raise their floor above known HIGH/CRITICAL CVEs. Poetry has no separate
+# constraints file, so an explicit entry is the supported way to bound a
+# transitive package. Drop these once mlflow's own floors move past them.
+gunicorn = "^22.0.0"     # CVE-2024-1135 / CVE-2024-6827 (request smuggling)
+protobuf = "^5.29.6"     # CVE-2026-0994 (recursion-depth DoS)
+pyarrow = "^23.0.1"      # CVE-2026-25087 (use-after-free DoS)
+starlette = "^1.6.0"     # 3 DoS CVEs in 0.46.x; fastapi permits it, but the
+                         # resolver keeps the older one unless asked
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.13.0"

@@ -32,6 +32,11 @@ resource "aws_db_instance" "mlflow_db" {
   skip_final_snapshot = true
   publicly_accessible = false
 
+  # Cifrado en reposo con la clave gestionada por AWS para RDS (aws/rds).
+  # No se puede activar sobre una instancia existente: cambiarlo fuerza el
+  # reemplazo de la instancia.
+  storage_encrypted = true
+
   tags = {
     Environment = var.environment
     Project     = var.project_name
