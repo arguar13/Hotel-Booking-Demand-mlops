@@ -8,3 +8,10 @@ metadata:
 data:
   DB_HOST: "REDACTED-RDS-ENDPOINT.rds.amazonaws.com"
   S3_BUCKET_NAME: "hotel-mlops-artifacts-production-REDACTED_ACCOUNT_ID"
+  # Base list (kubernetes/base/configmap.yaml) plus this environment's Load
+  # Balancer hostname, which MLflow >=3 needs on its --allowed-hosts list to
+  # accept requests that arrive through the ELB rather than by in-cluster
+  # service name - that includes opening the MLflow UI in a browser and running
+  # `python -m src.train` against it from a laptop.
+  # Get it with: kubectl get svc mlflow-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+  MLFLOW_ALLOWED_HOSTS: "mlflow-service,mlflow-service:5000,mlflow-service.default.svc.cluster.local,mlflow-service.default.svc.cluster.local:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000,REDACTED-ELB-HOSTNAME.elb.amazonaws.com,REDACTED-ELB-HOSTNAME.elb.amazonaws.com:5000"
