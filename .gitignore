@@ -35,6 +35,11 @@ dist/
 # contains live state (never belongs in git - use a remote backend), or is
 # a local plan artifact.
 terraform/.terraform/
+terraform/bootstrap/.terraform/
+# The bootstrap config keeps LOCAL state on purpose (see
+# terraform/bootstrap/main.tf) and that state contains a secret access
+# key - it must never be committed.
+terraform/bootstrap/terraform.tfstate*
 *.tfstate
 *.tfstate.*
 # Saved plan files, under any name (`-out=tfplan.bin` included): a plan
