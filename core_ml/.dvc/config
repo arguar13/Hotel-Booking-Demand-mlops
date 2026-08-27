@@ -2,5 +2,5 @@
     remote = s3remote
     analytics = false
 ['remote "s3remote"']
-    url = s3://hotel-mlops-artifacts-production-__AWS_ACCOUNT_ID__/dvc-store
+    url = s3://hotel-mlops-artifacts-production-REDACTED_ACCOUNT_ID/dvc-store
     region = us-east-1

@@ -37,7 +37,11 @@ dist/
 terraform/.terraform/
 *.tfstate
 *.tfstate.*
+# Saved plan files, under any name (`-out=tfplan.bin` included): a plan
+# holds fully-resolved values, so it can contain secrets pulled from data
+# sources (the RDS password) and generated credentials. Never commit one.
 *.tfplan
+tfplan*
 crash.log
 crash.*.log
 
@@ -52,3 +56,6 @@ creds.json
 creds.sh
 mlflow.db
 mlruns/
+
+# Office/Word lock files - created whenever a .docx in the repo is open
+~$*
