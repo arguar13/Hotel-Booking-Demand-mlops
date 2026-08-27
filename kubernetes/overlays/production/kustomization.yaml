@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+patches:
+  - path: patch-service-account-arns.yaml
+  - path: patch-mlops-config.yaml
+
+# Updated on every successful build by .gitlab-ci.yml's gitops-release job
+# via `kustomize edit set image <name>=<registry>/<repo>:<tag>` - a
+# structural edit of this file, never a text-substitution/sed hack. The
+# values below are placeholders for the *first* deploy; after that, this
+# block is only ever touched by that CI command.
+images:
+  - name: hotel-mlops-api
+    newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-api
+    newTag: latest
+  - name: hotel-mlops-dashboard
+    newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-dashboard
+    newTag: latest
+  - name: hotel-mlops-mlflow
+    newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-mlflow
+    newTag: latest

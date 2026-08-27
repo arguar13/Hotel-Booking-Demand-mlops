@@ -8,10 +8,18 @@ __pycache__/
 *.pyo
 *.pyd
 mlruns/
-data/
 .pytest_cache/
-junit/
+.ruff_cache/
+.mypy_cache/
 .dvc/
 .dvcignore
 Dockerfile
 docker-compose.yml
+
+# Datasets and DVC/Poetry state - never needed inside an image build; the
+# raw/processed CSVs alone are tens of MB and would otherwise bloat every
+# build context.
+core_ml/data/
+core_ml/.dvc/
+integration-tests/
+*.egg-info/

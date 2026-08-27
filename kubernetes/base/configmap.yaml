@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlops-config
+data:
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+  DB_HOST: "REPLACED_BY_OVERLAY"
+  DB_PORT: "5432"
+  POSTGRES_USER: "mlops_user"
+  POSTGRES_DB: "postgres"
+  S3_BUCKET_NAME: "REPLACED_BY_OVERLAY"
+  MODEL_REGISTRY_ALIAS: "staging"

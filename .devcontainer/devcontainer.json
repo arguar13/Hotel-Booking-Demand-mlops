@@ -1,0 +1,19 @@
+{
+  "name": "MLOps Python 3.12 Environment",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "hashicorp.terraform",
+        "ms-azuretools.vscode-docker",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+  "postCreateCommand": "pip install --user poetry && cd core_ml && poetry config virtualenvs.create false && poetry install && cd ../api && poetry config virtualenvs.create false && poetry install && cd .. && pre-commit install",
+  "remoteUser": "vscode"
+}

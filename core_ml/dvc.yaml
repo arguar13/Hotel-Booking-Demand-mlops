@@ -1,0 +1,26 @@
+stages:
+  clean_data:
+    cmd: python -m src.data_processing
+    deps:
+      - data/hotel_bookings.csv
+      - src/data_processing.py
+      - src/data_contracts.py
+      - src/config_loader.py
+    params:
+      - config/config.yaml:
+          - data.valid_classes_min_count
+    outs:
+      - data/processed_hotel_bookings.csv
+
+  clean_data_toy:
+    cmd: python -m src.data_processing --toy
+    deps:
+      - data/toy/hotel_bookings_toy.csv
+      - src/data_processing.py
+      - src/data_contracts.py
+      - src/config_loader.py
+    params:
+      - config/config.yaml:
+          - data.valid_classes_min_count
+    outs:
+      - data/toy/processed_hotel_bookings_toy.csv

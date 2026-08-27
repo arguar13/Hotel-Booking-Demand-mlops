@@ -1,0 +1,52 @@
+[tool.poetry]
+name = "hotel-mlops-integration-tests"
+version = "1.0.0"
+description = "Ephemeral, containerized integration tests (Testcontainers) proving the local stack works before touching AWS"
+authors = ["Tu Nombre <tu@email.com>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+testcontainers = {extras = ["postgres", "kafka", "localstack"], version = "^4.15.0"}
+psycopg2-binary = "==2.9.9"
+kafka-python = "^2.0.2"
+boto3 = "==1.34.62"
+requests = "==2.31.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.3"
+ruff = "^0.13.0"
+black = "^24.10.0"
+isort = "^5.13.2"
+mypy = "^1.13.0"
+bandit = {extras = ["toml"], version = "^1.7.10"}
+types-requests = "^2.32.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

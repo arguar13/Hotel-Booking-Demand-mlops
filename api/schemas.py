@@ -1,10 +1,11 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+
 
 class BookingFeatures(BaseModel):
     """
     Pydantic schema for validating hotel booking input data based on expected model features.
     """
+
     hotel: str = Field(..., example="Resort Hotel")
     lead_time: int = Field(..., ge=0, example=342)
     arrival_date_year: int = Field(..., example=2015)
@@ -35,5 +36,5 @@ class BookingFeatures(BaseModel):
     agent: float = Field(default=0.0, example=9.0)
     company: float = Field(default=0.0, example=0.0)
     # Optional variables
-    reservation_status: Optional[str] = None
-    reservation_status_date: Optional[str] = None
+    reservation_status: str | None = None
+    reservation_status_date: str | None = None
