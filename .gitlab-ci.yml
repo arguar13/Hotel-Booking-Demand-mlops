@@ -28,7 +28,12 @@ quality-gate:
   stage: test
   image: python:3.12-slim
   script:
-    - apt-get update && apt-get install -y --no-install-recommends make curl
+    # git is needed by core_ml/src/traceability.py: when CI_COMMIT_SHA is not
+    # set it falls back to `git rev-parse HEAD`, and test_traceability.py
+    # exercises exactly that fallback. python:3.12-slim ships without git (the
+    # runner clones with a separate helper image), so without this the test
+    # gets "unknown" and fails.
+    - apt-get update && apt-get install -y --no-install-recommends make curl git
     - curl -sSL https://install.python-poetry.org | python3 -
     - export PATH="/root/.local/bin:$PATH"
     # All three, not just api+core_ml: `make ci` lints and type-checks every
