@@ -27,10 +27,10 @@ configMapGenerator:
 images:
 - name: hotel-mlops-api
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-api
-  newTag: 5c2fd640e10cefba21debf1cf2aaea799fbf15cc
+  newTag: 02b8a4622c7009ed8e0be6defbb3a98457883c8f
 - name: hotel-mlops-dashboard
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-dashboard
-  newTag: 5c2fd640e10cefba21debf1cf2aaea799fbf15cc
+  newTag: 02b8a4622c7009ed8e0be6defbb3a98457883c8f
 - name: hotel-mlops-mlflow
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-mlflow
-  newTag: 5c2fd640e10cefba21debf1cf2aaea799fbf15cc
+  newTag: 02b8a4622c7009ed8e0be6defbb3a98457883c8f
