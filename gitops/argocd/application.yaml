@@ -1,0 +1,42 @@
+# The single source of truth for "what should be running in the cluster."
+# ArgoCD reconciles this continuously against kubernetes/overlays/production
+# in this same repo - nobody (including CI) ever runs `kubectl apply`
+# against the cluster directly. To change what's deployed: change a file
+# under kubernetes/, open a PR, merge to main. That's the only path.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hotel-mlops-production
+  namespace: argocd
+  finalizers:
+    # Ensures `argocd app delete` also removes the resources it created,
+    # instead of orphaning them in the cluster.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    # CHANGE_ME: point at this repo's real Git URL.
+    repoURL: https://gitlab.com/CHANGE_ME/hotel-mlops.git
+    targetRevision: main
+    path: kubernetes/overlays/production
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+
+  syncPolicy:
+    automated:
+      # If someone runs `kubectl edit deployment/api`, ArgoCD reverts it on
+      # the next sync - the cluster can never silently drift from Git.
+      selfHeal: true
+      # Deletes resources that are removed from kubernetes/overlays/production.
+      prune: true
+    syncOptions:
+      - CreateNamespace=false
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

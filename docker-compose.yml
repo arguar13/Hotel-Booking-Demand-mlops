@@ -1,0 +1,137 @@
+services:
+  db:
+    image: postgres:18.3
+    environment:
+      POSTGRES_USER: mlops_user
+      POSTGRES_PASSWORD: mlops_password
+      POSTGRES_DB: mlflow_db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlops_user -d mlflow_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # AWS emulator (S3, SQS, Secrets Manager) - lets MLflow, DVC, and the
+  # integration tests exercise real S3/SQS/Secrets Manager API calls
+  # without touching a real AWS account. Pinned to 4.14.0: LocalStack
+  # versions from 2026.03.0 onward require a free account + auth token
+  # (LOCALSTACK_AUTH_TOKEN) even for community services, which would add
+  # a signup step to what should be a zero-setup local stack. Upgrade path:
+  # sign up for the free Hobby tier, set LOCALSTACK_AUTH_TOKEN, then bump
+  # this to `latest`.
+  localstack:
+    image: localstack/localstack:4.14.0
+    environment:
+      - SERVICES=s3,sqs,secretsmanager
+      - DEBUG=0
+      - PERSISTENCE=0
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./localstack-init:/etc/localstack/init/ready.d
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Single-broker Kafka in KRaft mode (no ZooKeeper needed), using the
+  # official Apache Kafka image. Backs the optional prediction-event feed
+  # the API publishes to (see api/main.py); nothing breaks if this service
+  # isn't running - the API just skips publishing.
+  kafka:
+    image: apache/kafka:3.8.0
+    environment:
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mlops_user:mlops_password@db:5432/mlflow_db
+      --default-artifact-root s3://mlflow-artifacts/
+      --host 0.0.0.0 --port 5000
+    environment:
+      # Dummy credentials LocalStack accepts unconditionally; points MLflow's
+      # S3 artifact store at LocalStack instead of real AWS.
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - MLFLOW_S3_ENDPOINT_URL=http://localstack:4566
+    ports:
+      - "5000:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      # Same LocalStack S3 credentials/endpoint as the mlflow service above:
+      # mlflow.sklearn.load_model() pulls the model artifact straight from
+      # the s3:// artifact store via boto3, so the API needs S3 access too,
+      # not just the mlflow server itself. In production this is IRSA
+      # (api-sa's IAM role, see terraform/iam.tf) instead of static keys.
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - MLFLOW_S3_ENDPOINT_URL=http://localstack:4566
+    depends_on:
+      - mlflow
+      - kafka
+      - localstack
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+
+  # Real GitLab Runner, registered against this project, so CI jobs can be
+  # validated on this machine before they're ever pushed (`gitlab-runner
+  # exec` was removed from GitLab Runner - this is the current supported
+  # way to run a runner locally). Not started by `make up`; see `make
+  # runner-register` / `make runner-start`, both gated behind the
+  # `ci-local` profile so it never interferes with the app stack above.
+  gitlab-runner:
+    image: gitlab/gitlab-runner:latest
+    profiles: ["ci-local"]
+    volumes:
+      - gitlab-runner-config:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  gitlab-runner-config:

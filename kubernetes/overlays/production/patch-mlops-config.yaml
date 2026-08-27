@@ -1,0 +1,10 @@
+# Real values come from `terraform output rds_endpoint` / `terraform
+# output s3_bucket_name`. Same refresh cadence as the ARNs above -
+# infra-driven, not per-deploy.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlops-config
+data:
+  DB_HOST: "REDACTED-RDS-ENDPOINT.rds.amazonaws.com"
+  S3_BUCKET_NAME: "hotel-mlops-artifacts-production-REDACTED_ACCOUNT_ID"

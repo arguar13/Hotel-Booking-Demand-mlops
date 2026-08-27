@@ -1,0 +1,222 @@
+import logging
+import os
+
+import mlflow
+import mlflow.sklearn
+import optuna
+import pandas as pd
+import structlog
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline
+from mlflow.tracking import MlflowClient
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from src.config_loader import load_config
+from src.data_contracts import validate_processed
+from src.data_processing import use_toy_data
+from src.traceability import collect_traceability_tags
+
+# Same structured-JSON approach as api/main.py: one log line per event, as a
+# JSON object, ready for CloudWatch/Elasticsearch - not prose meant for a
+# human tailing a terminal.
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+log = structlog.get_logger("hotel_mlops.train")
+
+
+class QualityGateError(Exception):
+    """Raised when a trained model fails to meet the minimum quality bar.
+
+    The run is still logged to MLflow for audit, but it is never aliased in
+    the registry, so the serving API never picks it up.
+    """
+
+
+def train_pipeline() -> str:
+    """
+    Trains the ML pipeline, performs hyperparameter tuning with Optuna,
+    and logs the best model to MLflow as the single, immutable source of
+    truth for the model artifact (no loose model.joblib files).
+
+    Returns:
+        str: the MLflow run ID of the training run.
+    """
+    config = load_config()
+
+    # MLflow setup. MLFLOW_TRACKING_URI overrides config.yaml, e.g. to point
+    # a CI smoke run at a throwaway local SQLite store instead of a real server.
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI", config["mlflow"]["tracking_uri"])
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_experiment(config["mlflow"]["experiment_name"])
+
+    if use_toy_data():
+        processed_path = config["data"]["toy_processed_data_path"]
+        log.info("training_against_toy_dataset", processed_path=processed_path)
+    else:
+        processed_path = config["data"]["processed_data_path"]
+
+    # Load data - fail fast if it doesn't satisfy the processed data contract,
+    # before spending any compute on Optuna/SMOTE/model fitting.
+    df = pd.read_csv(processed_path)
+    df = validate_processed(df)
+
+    X = df.drop(columns=[config["model"]["target_column"]])
+    y = df[config["model"]["target_column"]]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=config["model"]["test_size"],
+        random_state=config["model"]["random_state"],
+        stratify=y,
+    )
+
+    # Preprocessing definitions
+    numeric_features = X.select_dtypes(include=["int64", "float64"]).columns
+    categorical_features = X.select_dtypes(include=["object"]).columns
+
+    # Numerical pipeline: Impute missing values with median, then scale
+    num_pipeline = Pipeline(
+        steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
+    )
+
+    # Categorical pipeline: Impute missing values with most frequent, then one-hot encode
+    cat_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore")),
+        ]
+    )
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", num_pipeline, numeric_features),
+            ("cat", cat_pipeline, categorical_features),
+        ]
+    )
+
+    def objective(trial):
+        n_estimators = trial.suggest_int("n_estimators", 50, 200)
+        max_depth = trial.suggest_int("max_depth", 5, 20)
+
+        model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=config["model"]["random_state"],
+        )
+
+        pipeline = Pipeline(
+            steps=[
+                ("preprocessor", preprocessor),
+                ("smote", SMOTE(random_state=config["model"]["random_state"])),
+                ("classifier", model),
+            ]
+        )
+
+        pipeline.fit(X_train, y_train)
+        preds = pipeline.predict(X_test)
+
+        return f1_score(y_test, preds, average="weighted")
+
+    log.info("optuna_tuning_started", n_trials=config["model"]["n_trials_optuna"])
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=config["model"]["n_trials_optuna"])
+
+    best_params = study.best_params
+    log.info("optuna_tuning_finished", best_params=best_params)
+
+    # Final Model Training with MLflow logging
+    with mlflow.start_run(run_name="Best_RandomForest_Model") as run:
+        mlflow.log_params(best_params)
+        mlflow.set_tags(collect_traceability_tags(processed_path))
+        mlflow.set_tag("used_toy_data", str(use_toy_data()))
+
+        final_model = RandomForestClassifier(
+            n_estimators=best_params["n_estimators"],
+            max_depth=best_params["max_depth"],
+            random_state=config["model"]["random_state"],
+        )
+
+        final_pipeline = Pipeline(
+            steps=[
+                ("preprocessor", preprocessor),
+                ("smote", SMOTE(random_state=config["model"]["random_state"])),
+                ("classifier", final_model),
+            ]
+        )
+
+        final_pipeline.fit(X_train, y_train)
+        y_pred = final_pipeline.predict(X_test)
+
+        # Metrics
+        f1 = f1_score(y_test, y_pred, average="weighted")
+        acc = accuracy_score(y_test, y_pred)
+
+        mlflow.log_metric("f1_score", f1)
+        mlflow.log_metric("accuracy", acc)
+
+        # Log the model as an immutable, versioned MLflow Registry entry -
+        # this is the only place the trained artifact lives; no local
+        # model.joblib is ever written.
+        registry_name = config["model"]["registry_name"]
+        mlflow.sklearn.log_model(
+            sk_model=final_pipeline,
+            artifact_path="model",
+            registered_model_name=registry_name,
+            serialization_format="cloudpickle",
+        )
+
+        run_id = run.info.run_id
+        log.info("run_logged", run_id=run_id, f1_score=f1, accuracy=acc)
+
+        # Quality gate: only alias the model version the serving API reads
+        # from if it clears the minimum bar. A run that fails the gate is
+        # still fully logged (metrics, params, artifact, traceability tags)
+        # for audit - it just never becomes servable. Uses the Model
+        # Registry alias API rather than the classic stages API, which
+        # MLflow has deprecated in favor of aliases.
+        min_f1 = config["model"]["min_f1_threshold"]
+        registry_alias = config["model"]["registry_alias"]
+        if f1 < min_f1:
+            mlflow.set_tag("quality_gate", "failed")
+            raise QualityGateError(
+                f"Run {run_id} scored f1={f1:.4f}, below the minimum "
+                f"threshold of {min_f1}. Not aliasing it as "
+                f"'{registry_alias}' in the registry."
+            )
+
+        mlflow.set_tag("quality_gate", "passed")
+        client = MlflowClient()
+        [registered_version] = client.search_model_versions(f"run_id='{run_id}'")
+        client.set_registered_model_alias(
+            name=registry_name,
+            alias=registry_alias,
+            version=registered_version.version,
+        )
+        log.info(
+            "model_version_aliased",
+            version=registered_version.version,
+            alias=registry_alias,
+            registry_name=registry_name,
+        )
+
+        return run_id
+
+
+if __name__ == "__main__":
+    train_pipeline()

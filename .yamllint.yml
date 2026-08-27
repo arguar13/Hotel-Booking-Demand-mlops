@@ -1,0 +1,29 @@
+---
+extends: default
+
+ignore: |
+  .venv/
+  **/.venv/
+  node_modules/
+  # Downloaded terraform provider/module cache (third-party code, not ours
+  # to lint) and MLflow's own generated per-run artifacts - both already
+  # git-ignored, but yamllint doesn't read .gitignore on its own.
+  terraform/.terraform/
+  **/mlruns/
+  **/__pycache__/
+  **/.mypy_cache/
+  **/.ruff_cache/
+  **/.pytest_cache/
+
+rules:
+  line-length:
+    max: 140
+    level: warning
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+  truthy:
+    allowed-values: ["true", "false", "on"]
+  braces:
+    max-spaces-inside: 1

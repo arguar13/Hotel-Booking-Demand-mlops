@@ -1,10 +1,4 @@
-FROM python:3.12-slim
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    POETRY_VERSION=1.8.2
-
-WORKDIR /app
+FROM ghcr.io/mlflow/mlflow:v2.10.0
 
 # Optional local CA trust for machines where a corporate/AV proxy performs
 # TLS interception on outbound HTTPS - see Dockerfile (api) for the full
@@ -15,14 +9,8 @@ ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-# Instalar Poetry
-RUN pip install poetry==$POETRY_VERSION
-
-COPY core_ml/pyproject.toml core_ml/poetry.lock* ./
-RUN poetry config virtualenvs.create false \
-    && poetry install --only main --no-interaction --no-ansi --no-root
-
-COPY core_ml/ ./core_ml/
-EXPOSE 8501
-
-CMD ["streamlit", "run", "core_ml/dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Baked in at build time rather than installed on every container start:
+# faster startup and no runtime dependency on internet/PyPI access.
+# psycopg2-binary: Postgres backend store. boto3: S3 (LocalStack locally,
+# real S3 in prod) artifact store.
+RUN pip install --no-cache-dir psycopg2-binary==2.9.9 boto3==1.34.62
