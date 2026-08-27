@@ -23,6 +23,11 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts_lifecycle" {
     id     = "archive-old-artifacts"
     status = "Enabled"
 
+    # Empty filter = "every object in the bucket". Required explicitly:
+    # a rule with neither `filter` nor `prefix` is a provider warning today
+    # and an error in a future AWS provider version.
+    filter {}
+
     transition {
       days          = 90
       storage_class = "STANDARD_IA"

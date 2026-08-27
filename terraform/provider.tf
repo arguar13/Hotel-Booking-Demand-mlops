@@ -9,15 +9,20 @@ terraform {
   # - bootstrap it once by hand:
   #
   #   aws s3api create-bucket --bucket <project>-tfstate-<account-id> --region us-east-1
-  #   aws dynamodb create-table --table-name <project>-tfstate-lock \
-  #     --attribute-definitions AttributeName=LockID,AttributeType=S \
-  #     --key-schema AttributeName=LockID,KeyType=HASH \
-  #     --billing-mode PAY_PER_REQUEST
+  #   aws s3api put-bucket-versioning --bucket <project>-tfstate-<account-id> \
+  #     --versioning-configuration Status=Enabled
   #
-  # then: terraform init -backend-config="bucket=<project>-tfstate-<account-id>" \
+  # then: terraform init \
+  #   -backend-config="bucket=<project>-tfstate-<account-id>" \
   #   -backend-config="key=hotel-mlops/terraform.tfstate" \
   #   -backend-config="region=us-east-1" \
-  #   -backend-config="dynamodb_table=<project>-tfstate-lock"
+  #   -backend-config="use_lockfile=true"
+  #
+  # State locking uses S3's own conditional writes (`use_lockfile`), not a
+  # DynamoDB table: `dynamodb_table` is deprecated as of Terraform 1.11 and
+  # S3-native locking needs no second resource to provision, pay for, or
+  # keep in sync with the bucket. Bucket versioning above is what makes a
+  # corrupted or truncated state recoverable.
   backend "s3" {}
 
   required_providers {

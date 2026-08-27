@@ -16,8 +16,7 @@ spec:
   project: default
 
   source:
-    # CHANGE_ME: point at this repo's real Git URL.
-    repoURL: https://gitlab.com/CHANGE_ME/hotel-mlops.git
+    repoURL: https://gitlab.com/personal-group7745334/hotel-booking-mlops-v2.git
     targetRevision: main
     path: kubernetes/overlays/production
 
