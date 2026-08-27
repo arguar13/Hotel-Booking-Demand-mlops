@@ -10,13 +10,14 @@ patches:
 # behavior: merge - overlays these values onto kubernetes/base/mlops-config.env
 # rather than replacing the whole ConfigMap, so base-only keys (DB_PORT,
 # MODEL_REGISTRY_ALIAS, ...) still come through.
-configMapGenerator:
-- name: mlops-config
-  behavior: merge
   # Flow style on purpose: `kustomize edit set image` rewrites this file on
   # every release and emits top-level sequences unindented, so a nested block
   # sequence here would make yamllint's indent-sequences check inconsistent.
-  envs: [mlops-config.env]
+configMapGenerator:
+- behavior: merge
+  envs:
+  - mlops-config.env
+  name: mlops-config
 
 # Updated on every successful build by .gitlab-ci.yml's gitops-release job
 # via `kustomize edit set image <name>=<registry>/<repo>:<tag>` - a
@@ -26,10 +27,10 @@ configMapGenerator:
 images:
 - name: hotel-mlops-api
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-api
-  newTag: 92d4d1cab46795cfdfe05df17af3ad48d2295d4b
+  newTag: 1b25f271c23db3292ddb9130359d44d45dcc54ce
 - name: hotel-mlops-dashboard
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-dashboard
-  newTag: 92d4d1cab46795cfdfe05df17af3ad48d2295d4b
+  newTag: 1b25f271c23db3292ddb9130359d44d45dcc54ce
 - name: hotel-mlops-mlflow
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-mlflow
-  newTag: 92d4d1cab46795cfdfe05df17af3ad48d2295d4b
+  newTag: 1b25f271c23db3292ddb9130359d44d45dcc54ce
