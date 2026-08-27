@@ -1,0 +1,78 @@
+# Trivy suppressions.
+#
+# Rules for this file:
+#   - Every entry states WHY it cannot simply be upgraded, and carries an
+#     expiry (`exp:`) so it fails the pipeline again instead of silently
+#     becoming permanent. An entry with no expiry is not acceptable here.
+#   - Suppress only when the fix is genuinely blocked upstream. Anything
+#     fixable by bumping a version belongs in the relevant pyproject.toml,
+#     not here - see the "transitive-only dependencies" blocks in
+#     api/pyproject.toml and core_ml/pyproject.toml for that pattern.
+#
+# ---------------------------------------------------------------------------
+# CVE-2026-69247 - cryptography 49.0.0 (HIGH)
+#
+# Blocked upstream, not by a choice made here: every published mlflow release
+# (3.15.2 is the latest as of this writing) declares `cryptography<50,>=43.0.0`,
+# so no resolvable dependency set exists that pairs mlflow with the fixed
+# cryptography 50.0.0. Pinning cryptography 50 makes `poetry lock` fail
+# outright.
+#
+# Exposure here is limited: cryptography is a transitive dependency reached
+# only through mlflow's own client code paths (artifact-store TLS and token
+# handling). This project never calls the affected primitives directly, and the
+# tracking server it talks to is inside the VPC, not internet-facing.
+#
+# Remove this entry as soon as mlflow widens the constraint - re-check with:
+#   curl -s https://pypi.org/pypi/mlflow/json | grep -o 'cryptography[^"]*'
+CVE-2026-69247 exp:2026-11-30
+
+# ---------------------------------------------------------------------------
+# AWS-0132 - "S3 encryption should use Customer Managed Keys"
+#
+# The artifacts bucket is encrypted at rest with SSE-S3 / AES-256
+# (terraform/s3.tf). A customer-managed KMS key would add per-request KMS
+# charges and a key policy to maintain, and buys nothing here: there is no
+# regulatory requirement to hold the key material, no cross-account access, and
+# no key-rotation-on-demand story this project needs. Revisit if this ever
+# stores customer PII rather than model artifacts.
+AWS-0132 exp:2027-06-30
+
+# ---------------------------------------------------------------------------
+# AWS-0031 - "ECR image tags shouldn't be mutable"
+#
+# What actually pins a deployment here is the immutable commit SHA that
+# `kustomize edit set image` writes into
+# kubernetes/overlays/production/kustomization.yaml - never a floating tag. CI
+# additionally pushes `:latest` as a human convenience, and IMMUTABLE tags make
+# re-pushing that fail the build. The GitOps flow already gives the property
+# this rule is protecting.
+AWS-0031 exp:2027-06-30
+
+# ---------------------------------------------------------------------------
+# AWS-0104 - "Security group rule allows unrestricted egress"
+#
+# terraform/vpc.tf's EKS node security group. Worker nodes must reach the EKS
+# control plane, ECR, S3, Secrets Manager and the upstream registries images
+# are pulled from. Constraining that to explicit prefixes would mean VPC
+# endpoints for every one of those services - real cost and operational
+# surface for a portfolio-scale deployment. *Ingress* is already restricted:
+# the RDS security group only accepts 5432 from this exact group.
+AWS-0104 exp:2027-06-30
+
+# ---------------------------------------------------------------------------
+# AWS-0040 / AWS-0041 - EKS public endpoint, open to 0.0.0.0/0
+#
+# Deliberate for this deployment, and narrower than it looks: CI never touches
+# the cluster (delivery is GitOps - ArgoCD pulls from inside the VPC), so the
+# only consumer of the public endpoint is the operator running kubectl from a
+# dynamic residential IP. Authentication is IAM (EKS access entries), not a
+# network boundary, and the worker nodes and RDS instance both sit in private
+# subnets.
+#
+# terraform/variables.tf exposes `cluster_endpoint_public_access_cidrs` so this
+# can be narrowed to a fixed office/VPN egress IP without editing eks.tf; a
+# production deployment should either do that or set
+# cluster_endpoint_public_access = false and reach the API through a bastion.
+AWS-0040 exp:2027-06-30
+AWS-0041 exp:2027-06-30

@@ -13,6 +13,16 @@ spec:
         app: api
     spec:
       serviceAccountName: api-sa
+      # UID 1000 is the `appuser` baked into the image (see Dockerfile).
+      # runAsNonRoot makes the kubelet refuse to start the pod at all if a
+      # future image regresses to running as root.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
           # Tag set per-overlay via `kustomize edit set image` (CI writes
@@ -20,6 +30,11 @@ spec:
           # .gitlab-ci.yml's gitops-release job).
           image: hotel-mlops-api:local
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 8000
           envFrom:
@@ -27,6 +42,15 @@ spec:
                 name: mlops-secrets
             - configMapRef:
                 name: mlops-config
+          # The root filesystem is read-only, so give the two paths that
+          # genuinely need to be written an ephemeral volume each: MLflow
+          # downloads the model artifact from S3 into a temp dir on startup,
+          # and its client keeps a small cache under $HOME.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/appuser
           readinessProbe:
             httpGet:
               path: /health
@@ -39,6 +63,11 @@ spec:
               port: 8000
             initialDelaySeconds: 15
             periodSeconds: 20
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

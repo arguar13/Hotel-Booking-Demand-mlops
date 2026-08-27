@@ -44,6 +44,21 @@ def _make_processed_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mlflow_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep each test's MLflow store hermetic.
+
+    `train_pipeline` deliberately lets MLFLOW_TRACKING_URI override config.yaml
+    (that is how CI points a smoke run at a throwaway SQLite store). But MLflow
+    itself *writes* MLFLOW_TRACKING_URI into os.environ while logging a model,
+    so without this the first test leaks its store into every later one: the
+    second test would register its model version into the first test's database
+    and then assert against its own empty one.
+    """
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("MLFLOW_REGISTRY_URI", raising=False)
+
+
 @pytest.fixture
 def base_config(tmp_path: Path) -> dict:
     processed_path = tmp_path / "processed.csv"

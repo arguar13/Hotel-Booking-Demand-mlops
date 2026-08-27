@@ -10,3 +10,10 @@ data:
   POSTGRES_DB: "postgres"
   S3_BUCKET_NAME: "REPLACED_BY_OVERLAY"
   MODEL_REGISTRY_ALIAS: "staging"
+  # MLflow >=3 refuses any request whose Host header is not on this list
+  # ("possible DNS rebinding attack"), defaulting to localhost + private IPs.
+  # These are the in-cluster names the api and dashboard use to reach the
+  # tracking server; without them every client call gets a 403 and the API
+  # never loads a model. The production overlay appends the Load Balancer
+  # hostname so the MLflow UI is also reachable from a browser.
+  MLFLOW_ALLOWED_HOSTS: "mlflow-service,mlflow-service:5000,mlflow-service.default.svc.cluster.local,mlflow-service.default.svc.cluster.local:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000"

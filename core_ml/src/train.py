@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 
 import mlflow
 import mlflow.sklearn
@@ -20,6 +21,15 @@ from src.config_loader import load_config
 from src.data_contracts import validate_processed
 from src.data_processing import use_toy_data
 from src.traceability import collect_traceability_tags
+
+# MLflow >=3 prints run/model links decorated with emoji. A Windows console
+# defaults to cp1252, which cannot encode them, so the process dies with
+# UnicodeEncodeError *after* the model has been trained, registered and
+# aliased - a non-zero exit for a run that actually succeeded. Force UTF-8 on
+# the standard streams; a no-op on Linux and in CI, where they already are.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 # Same structured-JSON approach as api/main.py: one log line per event, as a
 # JSON object, ready for CloudWatch/Elasticsearch - not prose meant for a
@@ -63,6 +73,15 @@ def train_pipeline() -> str:
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", config["mlflow"]["tracking_uri"])
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(config["mlflow"]["experiment_name"])
+    # Which store this run (and the model version it registers) actually landed
+    # in is the first thing you need when a run "disappears" - log it explicitly
+    # rather than inferring it from config precedence.
+    log.info(
+        "mlflow_configured",
+        tracking_uri=mlflow.get_tracking_uri(),
+        registry_uri=mlflow.get_registry_uri(),
+        experiment=config["mlflow"]["experiment_name"],
+    )
 
     if use_toy_data():
         processed_path = config["data"]["toy_processed_data_path"]

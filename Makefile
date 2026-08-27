@@ -67,9 +67,9 @@ security: ## Run bandit (SAST) in every sub-project + trivy IaC/secret scan
 	@echo "==> bandit (integration-tests)"; poetry -C integration-tests run bandit -q -r . --skip B101,B105,B106 || exit 1
 	@if command -v trivy >/dev/null 2>&1; then \
 		echo "==> trivy fs (secrets + vulnerabilities)"; \
-		trivy fs --exit-code 1 --severity HIGH,CRITICAL --skip-dirs '**/node_modules' .; \
+		trivy fs --exit-code 1 --severity HIGH,CRITICAL --skip-dirs '**/node_modules' --skip-dirs core_ml/data --skip-dirs core_ml/mlruns .; \
 		echo "==> trivy config (Dockerfiles, Kubernetes manifests, Terraform)"; \
-		trivy config --exit-code 1 --severity HIGH,CRITICAL .; \
+		trivy config --exit-code 1 --severity HIGH,CRITICAL --skip-dirs terraform/.terraform .; \
 	else \
 		echo "!! trivy not installed locally - skipping IaC/vuln scan (install: https://aquasecurity.github.io/trivy, or rely on the CI security job)"; \
 	fi

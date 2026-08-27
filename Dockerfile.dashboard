@@ -23,6 +23,17 @@ RUN poetry config virtualenvs.create false \
     && poetry install --only main --no-interaction --no-ansi --no-root
 
 COPY core_ml/ ./core_ml/
+
+# Unprivileged user - see Dockerfile (api) for why UID 1000 specifically.
+# STREAMLIT_* keep Streamlit's config/state inside the writable home dir
+# instead of the read-only root filesystem the Kubernetes securityContext
+# enforces (kubernetes/base/dashboard.yaml).
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+ENV HOME=/home/appuser \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
 EXPOSE 8501
 
 CMD ["streamlit", "run", "core_ml/dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

@@ -12,15 +12,40 @@ spec:
       labels:
         app: dashboard
     spec:
+      # UID 1000 is the `appuser` baked into the image (see Dockerfile.dashboard).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: dashboard
           image: hotel-mlops-dashboard:local
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 8501
           env:
             - name: API_URL
               value: "http://api-service.default.svc.cluster.local:8000"
+          # Read-only root filesystem: Streamlit writes its config and run
+          # state under $HOME (/home/appuser, set in Dockerfile.dashboard).
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: home
+              mountPath: /home/appuser
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
