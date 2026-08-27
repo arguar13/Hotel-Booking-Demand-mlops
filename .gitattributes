@@ -1,0 +1,21 @@
+# Everything this repository produces runs on Linux: the containers, the CI
+# runners, the cluster. So text files are stored AND checked out with LF, on
+# every platform, rather than letting core.autocrlf hand a Windows clone CRLF
+# copies.
+#
+# This is not cosmetic. With CRLF:
+#   - localstack-init/init-aws.sh breaks inside the container ("bad
+#     interpreter": the shebang line ends in \r),
+#   - yamllint's new-lines rule fails every YAML file, so `make ci` cannot pass
+#     on a Windows checkout even though it passes in CI,
+#   - the pre-commit mixed-line-ending hook rewrites files on every commit,
+#     producing a diff that never converges.
+* text=auto eol=lf
+
+# Binary formats: never touch these.
+*.docx binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.pdf  binary
+*.joblib binary

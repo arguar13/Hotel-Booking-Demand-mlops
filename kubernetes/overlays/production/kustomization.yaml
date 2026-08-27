@@ -10,9 +10,9 @@ patches:
 # behavior: merge - overlays these values onto kubernetes/base/mlops-config.env
 # rather than replacing the whole ConfigMap, so base-only keys (DB_PORT,
 # MODEL_REGISTRY_ALIAS, ...) still come through.
-  # Flow style on purpose: `kustomize edit set image` rewrites this file on
-  # every release and emits top-level sequences unindented, so a nested block
-  # sequence here would make yamllint's indent-sequences check inconsistent.
+# Note: `kustomize edit set image` rewrites this whole file on every release,
+# reordering keys and moving comments around - do not expect hand formatting
+# here to survive.
 configMapGenerator:
 - behavior: merge
   envs:
