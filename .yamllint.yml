@@ -16,6 +16,14 @@ ignore: |
   **/.pytest_cache/
 
 rules:
+  # `kustomize edit set image` rewrites
+  # kubernetes/overlays/production/kustomization.yaml on every release, and it
+  # emits block sequences unindented under their key. yamllint's default
+  # (indent-sequences: true) rejects that, so each CI release would have broken
+  # the *next* pipeline's yaml-lint. A tool owns the formatting of that file,
+  # so the linter accepts either style rather than fighting it.
+  indentation:
+    indent-sequences: whatever
   line-length:
     max: 140
     level: warning

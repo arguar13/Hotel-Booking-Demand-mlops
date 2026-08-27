@@ -6,7 +6,17 @@ resources:
 
 patches:
 - path: patch-service-account-arns.yaml
-- path: patch-mlops-config.yaml
+
+# behavior: merge - overlays these values onto kubernetes/base/mlops-config.env
+# rather than replacing the whole ConfigMap, so base-only keys (DB_PORT,
+# MODEL_REGISTRY_ALIAS, ...) still come through.
+configMapGenerator:
+- name: mlops-config
+  behavior: merge
+  # Flow style on purpose: `kustomize edit set image` rewrites this file on
+  # every release and emits top-level sequences unindented, so a nested block
+  # sequence here would make yamllint's indent-sequences check inconsistent.
+  envs: [mlops-config.env]
 
 # Updated on every successful build by .gitlab-ci.yml's gitops-release job
 # via `kustomize edit set image <name>=<registry>/<repo>:<tag>` - a
