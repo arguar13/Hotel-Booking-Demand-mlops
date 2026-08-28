@@ -9,17 +9,24 @@ variables:
   ECR_REPOSITORY_DASHBOARD: "hotel-mlops-dashboard"
   ECR_REPOSITORY_MLFLOW: "hotel-mlops-mlflow"
   EKS_CLUSTER_NAME: "hotel-mlops-cluster"
-  # ATENCIÓN: Actualiza este ARN con tu nuevo rol de IAM para GitLab
-  AWS_ROLE_ARN: "arn:aws:iam::REDACTED_ACCOUNT_ID:role/GitLabCIRole"
+  AWS_ROLE_ARN: "arn:aws:iam::REDACTED_ACCOUNT_ID:role/hotel-mlops-gitlab-ci"
   AWS_WEB_IDENTITY_TOKEN_FILE: "/tmp/web_identity_token"
 
-# Anclaje para la autenticación OIDC nativa de AWS con GitLab
+# Anclaje para la autenticación OIDC nativa de AWS con GitLab.
+# GITLAB_OIDC_TOKEN solo existe cuando GitLab real emite el id_token; bajo
+# gitlab-ci-local (validación local, sin servidor GitLab de por medio) no
+# hay quien lo emita, así que el before_script no escribe el archivo y
+# boto3 cae a su cadena de credenciales normal (AWS_ACCESS_KEY_ID/SECRET
+# exportadas localmente por el desarrollador). Mismo YAML en ambos mundos.
 .aws_auth: &aws_auth
   id_tokens:
     GITLAB_OIDC_TOKEN:
       aud: sts.amazonaws.com
   before_script:
-    - echo "$GITLAB_OIDC_TOKEN" > $AWS_WEB_IDENTITY_TOKEN_FILE
+    - |
+      if [ -n "$GITLAB_OIDC_TOKEN" ]; then
+        echo "$GITLAB_OIDC_TOKEN" > $AWS_WEB_IDENTITY_TOKEN_FILE
+      fi
 
 # The Makefile is the single interface for quality gates: the exact same
 # `make` targets run here and on a developer's machine via pre-commit, so
@@ -27,6 +34,7 @@ variables:
 quality-gate:
   stage: test
   image: python:3.12-slim
+  tags: ["local-hardware"]
   script:
     # git is needed by core_ml/src/traceability.py: when CI_COMMIT_SHA is not
     # set it falls back to `git rev-parse HEAD`, and test_traceability.py
@@ -54,6 +62,7 @@ trivy-scan:
   image:
     name: aquasec/trivy:latest
     entrypoint: [""]
+  tags: ["local-hardware"]
   script:
     # core_ml/mlruns holds MLflow's own per-run artifacts, each shipping a
     # frozen requirements.txt snapshot of whatever versions produced that run.
@@ -80,6 +89,7 @@ trivy-scan:
 train-smoke:
   stage: test
   image: python:3.12-slim
+  tags: ["local-hardware"]
   <<: *aws_auth
   script:
     - apt-get update && apt-get install -y --no-install-recommends make curl
@@ -107,6 +117,7 @@ integration-tests:
   image: docker:24.0.5
   services:
     - docker:24.0.5-dind
+  tags: ["local-hardware"]
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
@@ -124,6 +135,7 @@ build-push-ecr:
   image: docker:24.0.5
   services:
     - docker:24.0.5-dind
+  tags: ["local-hardware"]
   <<: *aws_auth
   script:
     - apk add --no-cache aws-cli
@@ -138,7 +150,11 @@ build-push-ecr:
     - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_API
 
     # Construcción y subida del Dashboard
-    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest -f Dockerfile.dashboard .
+    - >
+      docker build
+      -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG
+      -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:latest
+      -f Dockerfile.dashboard .
     - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD
 
     # Construcción y subida de MLflow (boto3/psycopg2 horneados en la imagen -
@@ -158,9 +174,13 @@ build-push-ecr:
 gitops-release:
   stage: deploy
   image: alpine:3.20
+  tags: ["local-hardware"]
   script:
     - apk add --no-cache git curl
-    - curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+    - >
+      curl -sL
+      "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
+      | tar xz -C /usr/local/bin
     - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - export IMAGE_TAG=$CI_COMMIT_SHA
     - cd kubernetes/overlays/production

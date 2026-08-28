@@ -63,7 +63,7 @@ variable "project_name" {
 # and runs helm_release against the cluster it just created. Enumerating a
 # policy that covers all of that with no gap that aborts a mid-apply is not
 # worth it for a bootstrap identity meant to be short-lived. Day-to-day CI does
-# not use it at all: that goes through GitLabCIRole (../iam.tf) via OIDC, with
+# not use it at all: that goes through the GitLab CI role (../iam.tf) via OIDC, with
 # no static credentials anywhere.
 resource "aws_iam_user" "automation" {
   name = "${var.project_name}-terraform-automation"
