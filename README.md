@@ -225,7 +225,26 @@ The environment automatically builds and runs `make install`, which installs eve
 | `make ci` | Everything above, exactly as run in the pipeline |
 | `make precommit` | Run every pre-commit hook against all files |
 
-### 3. Training the Model (Data Contracts + DVC + MLflow)
+### 3. Local CI Validation (zero GitLab minutes)
+
+Two layers, cheapest first, so no push has to reach GitLab to find out a job is broken:
+
+1. **[`gitlab-ci-local`](https://github.com/firecow/gitlab-ci-local)** — reads `.gitlab-ci.yml` and runs jobs as plain Docker containers on this machine, never contacting GitLab. Covers everything that doesn't touch AWS or push real artifacts.
+2. **A real self-hosted GitLab Runner**, registered against this project and running on this same hardware (`docker-compose`'s `ci-local` profile). Every job in `.gitlab-ci.yml` carries `tags: ["local-hardware"]`, so once this runner is registered and running, GitLab dispatches every job to it — never to GitLab.com's shared runners.
+
+| Command | What it does |
+|---|---|
+| `make ci-dry-run` | Runs `quality-gate`, `trivy-scan`, and `integration-tests` locally via `gitlab-ci-local` — 0 GitLab minutes |
+| `make ci-dry-run-train` | Runs `train-smoke` locally; needs AWS creds in `.gitlab-ci-local-variables.yml` (copy `.gitlab-ci-local-variables.yml.example`) since there's no `GITLAB_OIDC_TOKEN` outside real GitLab |
+| `make runner-register` | Registers this machine as a project runner (needs `GITLAB_URL` + `GITLAB_RUNNER_TOKEN` from Settings → CI/CD → Runners → New project runner) |
+| `make runner-start` | Starts the registered runner so it picks up real pipelines pushed to `main` |
+| `make runner-stop` | Stops it |
+
+`build-push-ecr` and `gitops-release` are deliberately excluded from `ci-dry-run`: they push real images to ECR and commit to Git, so there's no useful way to "dry-run" them without the side effects being real — they're validated for real, on this hardware, once the self-hosted runner picks up an actual push.
+
+**Once `tags: ["local-hardware"]` is in place, a push to `main` stays pending forever if the runner isn't registered and running** — start it with `make runner-start` before pushing.
+
+### 4. Training the Model (Data Contracts + DVC + MLflow)
 
 | Command | What it does |
 |---|---|
@@ -244,7 +263,7 @@ export MLFLOW_TRACKING_URI="sqlite:////tmp/mlflow-local.db"
 make train-toy
 ```
 
-### 4. Local Integration Testing
+### 5. Local Integration Testing
 
 ```bash
 make up   # equivalent to: docker compose up --build
@@ -254,10 +273,10 @@ make up   # equivalent to: docker compose up --build
 |---|---|
 | FastAPI Documentation | `http://localhost:8000/docs` |
 | FastAPI Health Check | `http://localhost:8000/health` |
-| MLflow UI | `http://localhost:5000` |
+| MLflow UI | `http://localhost:5050` |
 | Streamlit Dashboard | `http://localhost:8501` |
 | LocalStack (S3/SQS/Secrets Manager) | `http://localhost:4566` |
-| Kafka broker | `localhost:9092` |
+| Kafka broker | `localhost:19092` |
 
 Run the ephemeral Testcontainers suite (separate from the long-running stack above) with:
 
@@ -265,7 +284,7 @@ Run the ephemeral Testcontainers suite (separate from the long-running stack abo
 make test-integration
 ```
 
-### 5. Deploying Infrastructure
+### 6. Deploying Infrastructure
 
 One-time bootstrap of the remote state backend:
 
@@ -292,7 +311,7 @@ terraform -chdir=terraform apply
 
 This provisions the VPC/EKS/RDS/S3/ECR/IAM *and* bootstraps ArgoCD and External Secrets Operator into the cluster via Helm.
 
-### 6. GitOps Bootstrap
+### 7. GitOps Bootstrap
 
 After `terraform apply`, point ArgoCD at this repository once:
 

@@ -14,8 +14,11 @@ ALL_PROJECTS := api core_ml integration-tests
 .PHONY: help install lock format lint typecheck test test-api test-core-ml \
         test-integration security yaml-lint precommit precommit-install ci \
         clean up down data-toy dvc-repro dvc-pull dvc-push train train-toy \
+        ci-dry-run ci-dry-run-train \
         runner-register runner-start runner-stop k8s-build tf-fmt \
         tf-validate tf-plan
+
+GITLAB_CI_LOCAL_VERSION := 4.75.1
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -121,18 +124,52 @@ up: ## Start the full local stack (db, localstack, kafka, mlflow, api, dashboard
 down: ## Stop the local docker-compose stack
 	docker compose down
 
-# --- Local CI validation (real GitLab Runner, not the removed `exec` command) ---
+# --- Local CI validation ---
+# Two layers, cheapest first:
+#   1. ci-dry-run*    - gitlab-ci-local, pure Docker on this machine, never
+#                        talks to GitLab. Zero minutes, zero runner needed.
+#   2. runner-register/-start - a real GitLab Runner (docker-compose
+#                        `ci-local` profile) registered against this
+#                        project. Every job in .gitlab-ci.yml is pinned to
+#                        it via `tags: ["local-hardware"]`, so pushes to main are
+#                        executed on this hardware, never GitLab.com's
+#                        shared runners - but that also means a push
+#                        stays "pending" forever if this runner isn't
+#                        registered and running (`make runner-start`).
 
-runner-register: ## Register a real local GitLab Runner against this project (needs GITLAB_URL + GITLAB_RUNNER_TOKEN env vars)
+# MSYS_NO_PATHCONV=1: on Windows/Git Bash, MSYS auto-rewrites POSIX-looking
+# args (e.g. /builds/...) into Windows paths before they reach Docker,
+# which breaks the container workdir/volumes gitlab-ci-local sets up.
+# No-op on Linux/macOS. --privileged: integration-tests' docker:24.0.5-dind
+# service needs it to start its own inner dockerd - without it the service
+# container fails during its iptables/mount setup and the job's
+# `docker` hostname never resolves. CI_COMMIT_BRANCH=main overrides the
+# rules: `if: $CI_COMMIT_BRANCH == "main"` guard on every job, which
+# gitlab-ci-local otherwise derives from whatever local branch is checked
+# out - this makes it run regardless of which branch you're actually on.
+ci-dry-run: ## Simulate quality-gate/trivy-scan/integration-tests locally with gitlab-ci-local (0 GitLab minutes, needs Docker)
+	MSYS_NO_PATHCONV=1 npx --yes gitlab-ci-local@$(GITLAB_CI_LOCAL_VERSION) --privileged --variable CI_COMMIT_BRANCH=main quality-gate trivy-scan integration-tests
+
+ci-dry-run-train: ## Simulate train-smoke locally (needs AWS creds in .gitlab-ci-local-variables.yml, see .example)
+	MSYS_NO_PATHCONV=1 npx --yes gitlab-ci-local@$(GITLAB_CI_LOCAL_VERSION) --variable CI_COMMIT_BRANCH=main train-smoke
+
+# GitLab's newer runner-authentication-token flow (Settings > CI/CD > Runners
+# > New project runner > create it there, with tag "local-hardware" set in that form)
+# moved tags/description/locked/etc. server-side: passing --tag-list (or
+# --description) here is now a hard registration error, not just ignored
+# ("Runner configuration ... is reserved ... specified on the GitLab
+# server"). Make sure the runner you create in the UI carries the "local"
+# tag - .gitlab-ci.yml's tags: ["local-hardware"] on every job depends on it.
+runner-register: ## Register a real local GitLab Runner against this project (needs GITLAB_URL + GITLAB_RUNNER_TOKEN env vars, token from Settings > CI/CD > Runners > New project runner)
 	@test -n "$$GITLAB_URL" || (echo "Set GITLAB_URL (e.g. https://gitlab.com)" && exit 1)
-	@test -n "$$GITLAB_RUNNER_TOKEN" || (echo "Set GITLAB_RUNNER_TOKEN (Settings > CI/CD > Runners > project runner token)" && exit 1)
+	@test -n "$$GITLAB_RUNNER_TOKEN" || (echo "Set GITLAB_RUNNER_TOKEN (Settings > CI/CD > Runners > New project runner - authentication token)" && exit 1)
 	docker compose --profile ci-local run --rm gitlab-runner register \
 		--non-interactive \
 		--url "$$GITLAB_URL" \
 		--token "$$GITLAB_RUNNER_TOKEN" \
 		--executor docker \
 		--docker-image docker:24.0.5 \
-		--description "local-$$(hostname)"
+		--docker-privileged=true
 
 runner-start: ## Start the registered local runner, so it picks up real pipeline jobs on this machine
 	docker compose --profile ci-local up gitlab-runner

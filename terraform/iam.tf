@@ -139,18 +139,28 @@ variable "gitlab_project_path" {
   default     = "CHANGE_ME/hotel-mlops"
 }
 
-data "tls_certificate" "gitlab_oidc" {
-  url = "${var.gitlab_oidc_issuer_url}/.well-known/openid-configuration"
+# An IAM OIDC provider is a singleton per issuer URL *for the whole AWS
+# account*, not per Terraform state - a second `resource` block trying to
+# create "https://gitlab.com" again fails with EntityAlreadyExists the moment
+# any other project in this account has already registered it (verified here:
+# it already exists, created by a different project's Terraform, tagged
+# accordingly). Reading it as data instead of managing it as a resource means
+# this configuration adopts whichever provider is already there - with the
+# same client_id_list/thumbprint any GitLab.com issuer produces regardless of
+# who created it - without ever creating or destroying an account-wide
+# resource a sibling project also depends on.
+data "aws_iam_openid_connect_provider" "gitlab" {
+  url = var.gitlab_oidc_issuer_url
 }
 
-resource "aws_iam_openid_connect_provider" "gitlab" {
-  url             = var.gitlab_oidc_issuer_url
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.tls_certificate.gitlab_oidc.certificates[0].sha1_fingerprint]
-}
-
+# Named "GitLabCIRole" until this deployment: a bare, unprefixed name that
+# collided with an identically-named role from another project in this same
+# AWS account (each with its own OIDC trust condition scoped to a different
+# gitlab_project_path) - IAM role names are unique per account, not per
+# Terraform state. Prefixed with project_name like every other resource here
+# to make that collision structurally impossible going forward.
 resource "aws_iam_role" "gitlab_ci_role" {
-  name = "GitLabCIRole"
+  name = "${var.project_name}-gitlab-ci"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -158,7 +168,7 @@ resource "aws_iam_role" "gitlab_ci_role" {
       {
         Effect = "Allow"
         Principal = {
-          Federated = aws_iam_openid_connect_provider.gitlab.arn
+          Federated = data.aws_iam_openid_connect_provider.gitlab.arn
         }
         Action = "sts:AssumeRoleWithWebIdentity"
         Condition = {
@@ -216,4 +226,9 @@ resource "aws_iam_policy" "gitlab_ci_s3_dvc" {
 resource "aws_iam_role_policy_attachment" "gitlab_ci_s3_dvc" {
   role       = aws_iam_role.gitlab_ci_role.name
   policy_arn = aws_iam_policy.gitlab_ci_s3_dvc.arn
+}
+
+output "gitlab_ci_role_arn" {
+  value       = aws_iam_role.gitlab_ci_role.arn
+  description = "ARN to set as AWS_ROLE_ARN in .gitlab-ci.yml"
 }
