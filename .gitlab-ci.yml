@@ -143,8 +143,18 @@ build-push-ecr:
     # initializing - `docker login` doesn't need a live daemon (it only talks
     # to the registry over the network), so it can succeed while `docker
     # build` moments later still can't reach $DOCKER_HOST. Wait for the
-    # daemon to actually answer instead of racing it.
-    - for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    # daemon to actually answer instead of racing it. 90s, not 30s: on this
+    # runner's host, dockerd start-up is competing with whatever else Docker
+    # Desktop is already running (this project's own docker-compose stack,
+    # other projects' jobs) - 30 iterations reliably ran out before the
+    # daemon ever answered. Fail loudly if it never comes up instead of
+    # silently falling through into a doomed `docker build`.
+    - |
+      for i in $(seq 1 90); do
+        docker info >/dev/null 2>&1 && break
+        sleep 1
+      done
+      docker info >/dev/null 2>&1 || (echo "dockerd at $DOCKER_HOST never became reachable after 90s" && exit 1)
     - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - export IMAGE_TAG=$CI_COMMIT_SHA
 
