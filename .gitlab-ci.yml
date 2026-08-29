@@ -139,6 +139,12 @@ build-push-ecr:
   <<: *aws_auth
   script:
     - apk add --no-cache aws-cli
+    # The docker:dind service opens its TCP port before dockerd has finished
+    # initializing - `docker login` doesn't need a live daemon (it only talks
+    # to the registry over the network), so it can succeed while `docker
+    # build` moments later still can't reach $DOCKER_HOST. Wait for the
+    # daemon to actually answer instead of racing it.
+    - for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
     - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - export IMAGE_TAG=$CI_COMMIT_SHA
 
