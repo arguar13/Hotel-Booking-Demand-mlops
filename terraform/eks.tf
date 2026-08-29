@@ -26,7 +26,20 @@ module "eks" {
 
   eks_managed_node_groups = {
     general = {
-      desired_size = 2
+      # Bumped from 2 to 3 (still within the pre-existing max_size) after
+      # ip-10-0-2-176 went NotReady (kubelet stopped posting status) mid
+      # rollout: its pods stuck in Terminating (can't be force-deleted
+      # without direct node/pod-deletion access) left the one healthy node
+      # at its hard 17-pod ENI limit for t3.medium, blocking the correctly
+      # configured api replica from ever scheduling. Adding real capacity
+      # instead of fighting Kubernetes' own node-eviction bookkeeping.
+      # Note: the eks module ignores drift on scaling_config.desired_size
+      # (an external autoscaler is expected to own it after creation), so
+      # this edit alone does not resize anything - the actual scale-up used
+      # `aws eks update-nodegroup-config`. This value is kept in sync with
+      # that so a future `terraform apply` does not try to fight it back
+      # down to 2.
+      desired_size = 3
       min_size     = 1
       max_size     = 3
 
