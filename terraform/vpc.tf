@@ -38,6 +38,47 @@ resource "aws_security_group" "eks_nodes_sg" {
   }
 }
 
+# Sin reglas de ingreso, este grupo dejaba pasar todo el trafico saliente de
+# los nodos pero ninguno entrante - ademas del cluster primary security group
+# que el modulo EKS adjunta por su cuenta, el control plane necesita alcanzar
+# el kubelet de cada nodo (puerto 10250) para servir `kubectl logs`/`exec`, y
+# los nodos necesitan hablarse entre si para el trafico de pod a pod entre
+# distintas instancias EC2 (el CNI de VPC no lo cubre solo con el SG del
+# cluster). Sin esto, `kubectl get pods` funciona (el kubelet reporta su
+# propio estado hacia afuera) pero `kubectl logs`/`exec` fallan con "TLS
+# handshake timeout" - un sintoma de red, no un problema de la aplicacion.
+# Reglas minimas recomendadas por AWS para el SG de nodos EKS:
+# https://docs.aws.amazon.com/eks/latest/userguide/sec-group-reqs.html
+resource "aws_security_group_rule" "eks_nodes_from_cluster_kubelet" {
+  description              = "Kubelet API (logs/exec/metrics) desde el control plane de EKS"
+  type                     = "ingress"
+  from_port                = 10250
+  to_port                  = 10250
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.eks_nodes_sg.id
+  source_security_group_id = module.eks.cluster_security_group_id
+}
+
+resource "aws_security_group_rule" "eks_nodes_from_cluster_webhooks" {
+  description              = "Puertos efimeros para webhooks/API servers de extension (ej. metrics-server) desde el control plane"
+  type                     = "ingress"
+  from_port                = 1025
+  to_port                  = 65535
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.eks_nodes_sg.id
+  source_security_group_id = module.eks.cluster_security_group_id
+}
+
+resource "aws_security_group_rule" "eks_nodes_self" {
+  description       = "Trafico de pod a pod entre nodos distintos (CNI)"
+  type              = "ingress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  security_group_id = aws_security_group.eks_nodes_sg.id
+  self              = true
+}
+
 # Security Group para RDS asegurando aislamiento
 resource "aws_security_group" "rds_sg" {
   name        = "${var.project_name}-rds-sg"
