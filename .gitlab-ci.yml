@@ -136,6 +136,16 @@ build-push-ecr:
   services:
     - docker:24.0.5-dind
   tags: ["local-hardware"]
+  # Without DOCKER_TLS_CERTDIR="" the dind entrypoint defaults to generating
+  # TLS certs and binding the daemon on 2376 - it never opens the plain 2375
+  # port at all, so any client pointed at tcp://docker:2375 (TLS-less) fails
+  # with "Cannot connect to the Docker daemon" no matter how long it waits;
+  # this isn't a startup race, it's a protocol/port mismatch. integration-tests
+  # already sets both of these for the same reason - this job needs them too,
+  # it just never had them.
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
   <<: *aws_auth
   script:
     - apk add --no-cache aws-cli
