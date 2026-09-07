@@ -12,7 +12,12 @@ variables:
   # The drift-monitor CronJob runs from it.
   ECR_REPOSITORY_JOBS: "hotel-mlops-jobs"
   EKS_CLUSTER_NAME: "hotel-mlops-cluster"
-  AWS_ROLE_ARN: "arn:aws:iam::REDACTED_ACCOUNT_ID:role/hotel-mlops-gitlab-ci"
+  # AWS_ACCOUNT_ID is a protected/masked project CI/CD variable (GitLab
+  # Settings > CI/CD > Variables), not a literal here - the account number
+  # has no business living in a file every contributor and fork can read,
+  # and hardcoding it three times in this file meant changing AWS account
+  # was a three-line diff instead of a one-field settings change.
+  AWS_ROLE_ARN: "arn:aws:iam::$AWS_ACCOUNT_ID:role/hotel-mlops-gitlab-ci"
   AWS_WEB_IDENTITY_TOKEN_FILE: "/tmp/web_identity_token"
 
 # Anclaje para la autenticación OIDC nativa de AWS con GitLab.
@@ -168,7 +173,7 @@ build-push-ecr:
         sleep 1
       done
       docker info >/dev/null 2>&1 || (echo "dockerd at $DOCKER_HOST never became reachable after 90s" && exit 1)
-    - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+    - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - export IMAGE_TAG=$CI_COMMIT_SHA
 
     # Autenticación en Amazon ECR
@@ -216,7 +221,7 @@ gitops-release:
       curl -sL
       "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
       | tar xz -C /usr/local/bin
-    - export ECR_REGISTRY="REDACTED_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+    - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - export IMAGE_TAG=$CI_COMMIT_SHA
     - cd kubernetes/overlays/production
     - kustomize edit set image hotel-mlops-api=$ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG
