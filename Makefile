@@ -15,6 +15,7 @@ ALL_PROJECTS := api core_ml integration-tests
         test-integration security yaml-lint precommit precommit-install ci \
         clean up down data-toy dvc-repro dvc-pull dvc-push train train-toy \
         ci-dry-run ci-dry-run-train replay replay-drift drift-report \
+        stream-up stream-logs promote promote-rollback \
         runner-register runner-start runner-stop k8s-build tf-fmt \
         tf-validate tf-plan
 
@@ -134,6 +135,17 @@ replay-drift: ## Replay real 2017 bookings - the period where the channel mix ac
 
 drift-report: ## Run the drift monitor against the local stack, from the real jobs image
 	docker compose --profile jobs run --rm --build drift-monitor
+
+# stream-consumer is a long-running process (unlike drift-monitor, which
+# runs once and exits) - `up -d`, not `run --rm`. api's own
+# KAFKA_BOOTSTRAP_SERVERS is already set in this same file, so a
+# request through `make up`'s api service publishes an event this
+# consumer picks up without any extra configuration.
+stream-up: ## Start the streaming consumer against this stack's own Kafka (no real MSK needed)
+	docker compose --profile jobs up -d --build stream-consumer
+
+stream-logs: ## Follow the streaming consumer's logs (PSI/confidence drift verdicts, mitigation attempts)
+	docker compose logs -f stream-consumer
 
 clean: ## Remove caches and build artifacts
 	@find . -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.ruff_cache' -o -name '.mypy_cache' \) -not -path '*/.git/*' -exec rm -rf {} + 2>/dev/null || true

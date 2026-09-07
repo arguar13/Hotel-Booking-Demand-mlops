@@ -188,6 +188,35 @@ services:
       mlflow:
         condition: service_started
 
+  # core_ml/src/monitoring/stream_consumer.py against this stack's own
+  # Kafka - the only way to exercise it end to end without touching the
+  # real MSK cluster terraform/msk.tf provisions. GITLAB_* deliberately
+  # unset: mitigation.py's trigger call then fails, is caught, and is
+  # recorded as "failed" - the correct behaviour for testing drift
+  # detection locally without launching a real GitLab pipeline.
+  stream-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.jobs
+    command: ["python", "-m", "src.monitoring.stream_consumer"]
+    profiles: ["jobs"]
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - DB_HOST=db
+      - DB_PORT=5432
+      - POSTGRES_USER=mlops_user
+      - POSTGRES_PASSWORD=mlops_password
+      - POSTGRES_DB=mlflow_db
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_SECURITY_PROTOCOL=PLAINTEXT
+    depends_on:
+      db:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+
   # Real GitLab Runner, registered against this project, so CI jobs can be
   # validated on this machine before they're ever pushed (`gitlab-runner
   # exec` was removed from GitLab Runner - this is the current supported
