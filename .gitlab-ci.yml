@@ -60,7 +60,10 @@ quality-gate:
     - poetry -C integration-tests install --no-interaction
     - make ci
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
+    # auto-retrain job below - not the full push pipeline (tests, image
+    # builds, gitops-release) a mitigation trigger has no reason to repeat.
+    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
 
 # Trivy needs its own job (rather than `make security`'s local-only trivy check)
 # because it isn't installed in the quality-gate image; the official trivy
@@ -86,7 +89,10 @@ trivy-scan:
     # somebody else's code.
     - trivy config --exit-code 1 --severity HIGH,CRITICAL --skip-dirs terraform/.terraform .
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
+    # auto-retrain job below - not the full push pipeline (tests, image
+    # builds, gitops-release) a mitigation trigger has no reason to repeat.
+    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
 
 # Proves the data-contract -> DVC -> train -> quality-gate -> MLflow Registry
 # loop actually works, end to end, on every push - not just the unit tests
@@ -112,7 +118,10 @@ train-smoke:
     - export MLFLOW_TRACKING_URI="sqlite:///$CI_PROJECT_DIR/mlflow-ci-smoke.db"
     - make train-toy
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
+    # auto-retrain job below - not the full push pipeline (tests, image
+    # builds, gitops-release) a mitigation trigger has no reason to repeat.
+    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
 
 # Testcontainers spin up real Postgres/Kafka/LocalStack containers and build
 # the real api/Dockerfile - proving the local stack described in
@@ -136,7 +145,10 @@ integration-tests:
     - poetry -C integration-tests install --no-interaction
     - poetry -C integration-tests run pytest -v
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
+    # auto-retrain job below - not the full push pipeline (tests, image
+    # builds, gitops-release) a mitigation trigger has no reason to repeat.
+    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
 
 build-push-ecr:
   stage: build
@@ -202,7 +214,10 @@ build-push-ecr:
     - docker build --build-arg GIT_COMMIT_SHA=$CI_COMMIT_SHA -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:latest -f Dockerfile.jobs .
     - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_JOBS
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
+    # auto-retrain job below - not the full push pipeline (tests, image
+    # builds, gitops-release) a mitigation trigger has no reason to repeat.
+    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
 
 # GitOps release: CI's job ends at updating *desired state in Git*. It never
 # touches the cluster - no `kubectl apply`, no direct AWS mutation of
@@ -238,4 +253,41 @@ gitops-release:
         git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
       )
   rules:
-    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
+    # auto-retrain job below - not the full push pipeline (tests, image
+    # builds, gitops-release) a mitigation trigger has no reason to repeat.
+    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
+
+# Triggered by core_ml/src/monitoring/mitigation.py's call to GitLab's
+# Pipeline Trigger API (AUTO_RETRAIN=true, plus TRIGGER_SOURCE/
+# TRIGGER_REASON/TRIGGER_MODEL_VERSION - see that module's docstring),
+# never by a push. This is exactly what mitigation.py is bounded to
+# launching, and no more: `make train` produces a registered candidate,
+# `make promote` is the canary comparison against whatever is currently
+# aliased that decides - separately, afterwards - whether it ever serves
+# traffic. A retrain that promote_model.py rejects leaves this job failed
+# and production untouched; see that module's docstring for why the
+# comparison is not skipped just because the retrain was automatic.
+#
+# MLFLOW_TRACKING_URI must be set as a project CI/CD variable (Settings >
+# CI/CD > Variables) pointing at the real production MLflow server - unlike
+# train-smoke's throwaway SQLite store, this run's entire purpose is to
+# compare against, and potentially replace, the version actually serving.
+auto-retrain:
+  stage: deploy
+  image: python:3.12-slim
+  tags: ["local-hardware"]
+  <<: *aws_auth
+  script:
+    - echo "Auto-retrain triggered - source=${TRIGGER_SOURCE:-unknown}"
+    - echo "reason=${TRIGGER_REASON:-unknown} model_version=${TRIGGER_MODEL_VERSION:-unknown}"
+    - apt-get update && apt-get install -y --no-install-recommends make curl
+    - curl -sSL https://install.python-poetry.org | python3 -
+    - export PATH="/root/.local/bin:$PATH"
+    - poetry -C core_ml install --no-interaction
+    - export AWS_ACCOUNT_ID=$(poetry -C core_ml run python -c "import boto3; print(boto3.client('sts').get_caller_identity()['Account'])")
+    - poetry -C core_ml run dvc remote modify s3remote url "s3://hotel-mlops-artifacts-production-${AWS_ACCOUNT_ID}/dvc-store"
+    - make train
+    - make promote
+  rules:
+    - if: '$AUTO_RETRAIN == "true"'

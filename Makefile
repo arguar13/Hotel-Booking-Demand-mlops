@@ -114,6 +114,12 @@ train-toy: ## Fast (~seconds) end-to-end training run against the toy dataset
 	poetry -C core_ml run dvc repro clean_data_toy
 	HOTEL_MLOPS_USE_TOY_DATA=true poetry -C core_ml run python -m src.train
 
+promote: ## Canary-compare core_ml/run_id.txt's run against production and promote if it clears the bar
+	poetry -C core_ml run python -m src.promote_model --run-id "$$(cat core_ml/run_id.txt)"
+
+promote-rollback: ## Move the registry alias back to the previously promoted version
+	poetry -C core_ml run python -m src.promote_model --rollback
+
 # --- Monitoring / drift ---
 # The loop, runnable end to end on a laptop: `make up`, train a model, replay a
 # slice of real bookings through the API (which logs every prediction and its

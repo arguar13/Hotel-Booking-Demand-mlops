@@ -85,7 +85,17 @@ def base_config(tmp_path: Path) -> dict:
     }
 
 
-def test_train_pipeline_promotes_model_when_quality_gate_passes(base_config, monkeypatch) -> None:
+def test_train_pipeline_registers_a_promotion_candidate_when_quality_gate_passes(
+    base_config, monkeypatch
+) -> None:
+    """train.py registers and tags the version; it no longer moves the alias.
+
+    Promotion is promote_model.py's job (see that module's docstring for
+    why: an absolute quality gate alone cannot tell a version that clears
+    the floor but is worse than what is already serving). This test
+    documents the boundary - the companion end-to-end test in
+    test_promote_model.py covers train_pipeline() followed by promote().
+    """
     monkeypatch.setattr(train_module, "load_config", lambda: base_config)
     monkeypatch.setattr(train_module, "use_toy_data", lambda: False)
 
@@ -99,9 +109,13 @@ def test_train_pipeline_promotes_model_when_quality_gate_passes(base_config, mon
 
     versions = client.search_model_versions(f"name='{registry_name}'")
     assert len(versions) == 1
+    assert versions[0].run_id == run_id
 
-    aliased_version = client.get_model_version_by_alias(registry_name, registry_alias)
-    assert aliased_version.version == versions[0].version
+    run = client.get_run(run_id)
+    assert run.data.tags.get("quality_gate") == "passed"
+
+    with pytest.raises(MlflowException):
+        client.get_model_version_by_alias(registry_name, registry_alias)
 
 
 def test_train_pipeline_fails_quality_gate_without_promoting(base_config, monkeypatch) -> None:
