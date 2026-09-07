@@ -35,6 +35,17 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # A pod with no limit can starve its node's other workloads under
+          # load, and one with no request leaves the scheduler guessing -
+          # sized for a sklearn RandomForest pipeline plus pandas held in
+          # memory per request, with headroom for a rollout's brief overlap.
+          resources:
+            requests:
+              cpu: "150m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
           ports:
             - containerPort: 8000
           envFrom:

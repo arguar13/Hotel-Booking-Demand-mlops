@@ -29,6 +29,15 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # Streamlit rendering a handful of charts against api-service's
+          # responses - the lightest workload in this repo by a wide margin.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
           ports:
             - containerPort: 8501
           env:
