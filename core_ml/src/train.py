@@ -28,9 +28,9 @@ from src.traceability import collect_traceability_tags
 
 # MLflow >=3 prints run/model links decorated with emoji. A Windows console
 # defaults to cp1252, which cannot encode them, so the process dies with
-# UnicodeEncodeError *after* the model has been trained, registered and
-# aliased - a non-zero exit for a run that actually succeeded. Force UTF-8 on
-# the standard streams; a no-op on Linux and in CI, where they already are.
+# UnicodeEncodeError *after* the model has been trained and registered - a
+# non-zero exit for a run that actually succeeded. Force UTF-8 on the
+# standard streams; a no-op on Linux and in CI, where they already are.
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -305,39 +305,45 @@ def train_pipeline() -> str:
         run_id = run.info.run_id
         log.info("run_logged", run_id=run_id, f1_score=f1, accuracy=acc)
 
-        # Quality gate: only alias the model version the serving API reads
-        # from if it clears the minimum bar. A run that fails the gate is
-        # still fully logged (metrics, params, artifact, traceability tags)
-        # for audit - it just never becomes servable. Uses the Model
-        # Registry alias API rather than the classic stages API, which
-        # MLflow has deprecated in favor of aliases.
+        # Quality gate: an absolute floor a version must clear to even be
+        # *considered* for promotion. A run that fails it is still fully
+        # logged (metrics, params, artifact, traceability tags) for audit -
+        # it just can never reach promote_model.py's canary comparison,
+        # let alone win it. This gate alone cannot tell a version that beats
+        # the floor but is worse than what is already serving - that
+        # comparison is promote_model.py's job, not this one's.
         min_f1 = config["model"]["min_f1_threshold"]
         registry_alias = config["model"]["registry_alias"]
         if f1 < min_f1:
             mlflow.set_tag("quality_gate", "failed")
             raise QualityGateError(
                 f"Run {run_id} scored f1={f1:.4f}, below the minimum "
-                f"threshold of {min_f1}. Not aliasing it as "
-                f"'{registry_alias}' in the registry."
+                f"threshold of {min_f1}. Not eligible for promotion to "
+                f"'{registry_alias}'."
             )
 
         mlflow.set_tag("quality_gate", "passed")
-        client = MlflowClient()
-        [registered_version] = client.search_model_versions(f"run_id='{run_id}'")
-        client.set_registered_model_alias(
-            name=registry_name,
-            alias=registry_alias,
-            version=registered_version.version,
-        )
+        [registered_version] = MlflowClient().search_model_versions(f"run_id='{run_id}'")
         log.info(
-            "model_version_aliased",
+            "model_version_registered",
             version=registered_version.version,
-            alias=registry_alias,
             registry_name=registry_name,
+            next_step=(
+                f"run `python -m src.promote_model --run-id {run_id}` to compare this "
+                f"version against whatever is currently aliased '{registry_alias}' and, "
+                "if it clears the canary bar, move the alias"
+            ),
         )
 
         return run_id
 
 
 if __name__ == "__main__":
-    train_pipeline()
+    completed_run_id = train_pipeline()
+    # structlog is configured above to print JSON lines to this same stdout
+    # (PrintLoggerFactory), so the run id cannot just be `print()`-ed without
+    # a caller having to pick it out of a log stream. A file is what lets
+    # .gitlab-ci.yml's auto-retrain job (kicked off by mitigation.py) chain
+    # straight into `python -m src.promote_model --run-id $(cat run_id.txt)`
+    # without parsing logs.
+    Path("run_id.txt").write_text(completed_run_id, encoding="utf-8")

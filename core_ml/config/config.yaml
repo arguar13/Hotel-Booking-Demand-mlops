@@ -31,11 +31,33 @@ model:
   validation_size: 0.2
   random_state: 42
   n_trials_optuna: 2
-  # Quality gate: a trained model version is only aliased below when its
-  # weighted F1 on the held-out test split meets this bar. A run that
-  # misses it is still logged to MLflow for audit, but the run fails
-  # loudly (non-zero exit) instead of silently shipping a weak model.
+  # Quality gate: a trained model version is only ever a promotion
+  # *candidate* when its weighted F1 on the held-out test split meets this
+  # bar. A run that misses it is still logged to MLflow for audit, but the
+  # run fails loudly (non-zero exit) and is never considered by
+  # promote_model.py. Absolute, not relative - it is the floor a model must
+  # clear regardless of how the currently-served version is doing.
   min_f1_threshold: 0.60
+
+  # Promotion (core_ml/src/promote_model.py), the step *after* train.py:
+  # train.py registers a version and applies min_f1_threshold above, but no
+  # longer moves the registry alias itself - that decision now requires
+  # beating the model already serving, not just clearing an absolute floor.
+  # Passing min_f1_threshold and still being worse than production is
+  # exactly the gap an absolute-only gate cannot see, and exactly what let
+  # a retrain triggered by drift promote a regression with nobody having
+  # compared the two.
+  #
+  # canary_tolerance allows the challenger to score up to this much *below*
+  # the champion's weighted F1 and still promote - a small negative number,
+  # not zero, because requiring a strict improvement on every retrain would
+  # reject a model that recovered most but not all of a real regression,
+  # which is still worth shipping. Both figures are read from each model
+  # version's own logged reference profile (build_reference_profile's
+  # performance.f1_weighted), not from a live re-scoring pass - see
+  # promote_model.py's module docstring for why that trade-off was made
+  # consciously rather than overlooked.
+  canary_tolerance: -0.01
   registry_name: "HotelSegmentClassifier"
   # MLflow Model Registry alias (not the deprecated stages API) the serving
   # API reads from via `models:/<registry_name>@<registry_alias>`.
