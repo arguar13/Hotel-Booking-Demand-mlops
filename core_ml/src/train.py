@@ -1,9 +1,12 @@
 import logging
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 import mlflow
 import mlflow.sklearn
+import numpy as np
 import optuna
 import pandas as pd
 import structlog
@@ -20,6 +23,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from src.config_loader import load_config
 from src.data_contracts import validate_processed
 from src.data_processing import use_toy_data
+from src.monitoring.profile import PerformanceBaseline, build_reference_profile
 from src.traceability import collect_traceability_tags
 
 # MLflow >=3 prints run/model links decorated with emoji. A Windows console
@@ -47,6 +51,26 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 log = structlog.get_logger("hotel_mlops.train")
+
+
+def _confidence_signals(pipeline, features: pd.DataFrame) -> tuple[float | None, float | None]:
+    """Mean top-class probability and mean top-two margin on the held-out split.
+
+    These become the baseline the drift monitor compares live confidence
+    against - the unsupervised early-warning signal it relies on while a window
+    is still waiting for ground truth. Measured here, on data the model has not
+    seen, because an in-sample figure would be optimistically high and would
+    make ordinary production traffic read as a confidence collapse.
+    """
+    predict_proba = getattr(pipeline, "predict_proba", None)
+    if predict_proba is None:
+        return None, None
+    probabilities = predict_proba(features)
+    if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+        return None, None
+    ordered = np.sort(probabilities, axis=1)
+    top, runner_up = ordered[:, -1], ordered[:, -2]
+    return float(np.mean(top)), float(np.mean(top - runner_up))
 
 
 class QualityGateError(Exception):
@@ -93,6 +117,23 @@ def train_pipeline() -> str:
     # before spending any compute on Optuna/SMOTE/model fitting.
     df = pd.read_csv(processed_path)
     df = validate_processed(df)
+
+    # Optional training period. A model is only ever fitted on data up to some
+    # point in time, and saying so explicitly is what lets the drift monitor's
+    # baseline mean "the world as of <date>" rather than "whatever was in the
+    # CSV". Also what makes a genuine drift backtest possible - see
+    # config.yaml's train_max_year.
+    train_max_year = config["data"].get("train_max_year")
+    if train_max_year and "arrival_date_year" in df.columns:
+        before = len(df)
+        df = df[df["arrival_date_year"] <= int(train_max_year)]
+        log.info(
+            "training_period_applied",
+            train_max_year=int(train_max_year),
+            rows_kept=len(df),
+            rows_dropped=before - len(df),
+        )
+        df = validate_processed(df)
 
     X = df.drop(columns=[config["model"]["target_column"]])
     y = df[config["model"]["target_column"]]
@@ -188,6 +229,42 @@ def train_pipeline() -> str:
 
         mlflow.log_metric("f1_score", f1)
         mlflow.log_metric("accuracy", acc)
+
+        # --- Monitoring baseline -------------------------------------------
+        # Drift is a comparison, so a model is only monitorable if the
+        # distribution it was fitted on travels with it. This writes that
+        # baseline - feature histograms, the target mix, and the held-out
+        # performance and confidence figures - as an artifact of this run, which
+        # makes it immutable and reachable from the model version alone. The
+        # drift CronJob reads it back through the registry alias and never needs
+        # the training dataset, DVC, or bucket credentials to do its job.
+        #
+        # Built from X_train/y_train, not the full frame: the reference for
+        # "what did this model learn from" is exactly the rows it was fitted on.
+        mean_confidence, mean_margin = _confidence_signals(final_pipeline, X_test)
+        reference_profile = build_reference_profile(
+            features=X_train,
+            target=y_train,
+            target_column=config["model"]["target_column"],
+            performance=PerformanceBaseline(
+                f1_weighted=float(f1),
+                accuracy=float(acc),
+                mean_confidence=mean_confidence,
+                mean_margin=mean_margin,
+                n_eval=int(len(y_test)),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as staging_dir:
+            profile_path = Path(staging_dir) / "reference_profile.json"
+            reference_profile.write(profile_path)
+            mlflow.log_artifact(str(profile_path), artifact_path="monitoring")
+        log.info(
+            "reference_profile_logged",
+            numeric_features=len(reference_profile.numeric),
+            categorical_features=len(reference_profile.categorical),
+            baseline_f1=float(f1),
+            baseline_mean_confidence=mean_confidence,
+        )
 
         # Log the model as an immutable, versioned MLflow Registry entry -
         # this is the only place the trained artifact lives; no local

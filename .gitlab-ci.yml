@@ -8,6 +8,9 @@ variables:
   ECR_REPOSITORY_API: "hotel-mlops-api"
   ECR_REPOSITORY_DASHBOARD: "hotel-mlops-dashboard"
   ECR_REPOSITORY_MLFLOW: "hotel-mlops-mlflow"
+  # Batch image (Dockerfile.jobs): core_ml packaged to run inside the cluster.
+  # The drift-monitor CronJob runs from it.
+  ECR_REPOSITORY_JOBS: "hotel-mlops-jobs"
   EKS_CLUSTER_NAME: "hotel-mlops-cluster"
   AWS_ROLE_ARN: "arn:aws:iam::REDACTED_ACCOUNT_ID:role/hotel-mlops-gitlab-ci"
   AWS_WEB_IDENTITY_TOKEN_FILE: "/tmp/web_identity_token"
@@ -187,6 +190,12 @@ build-push-ecr:
     # ver Dockerfile.mlflow; nada de `pip install` en cada arranque del pod)
     - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW:latest -f Dockerfile.mlflow .
     - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW
+
+    # Construcción y subida de la imagen batch (core_ml dentro del cluster).
+    # Es la que ejecuta el CronJob de drift, y la que faltaba para que algo
+    # del lado de entrenamiento/monitoreo pudiera correr fuera de un portátil.
+    - docker build --build-arg GIT_COMMIT_SHA=$CI_COMMIT_SHA -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:latest -f Dockerfile.jobs .
+    - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_JOBS
   rules:
     - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
 
@@ -213,6 +222,7 @@ gitops-release:
     - kustomize edit set image hotel-mlops-api=$ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG
     - kustomize edit set image hotel-mlops-dashboard=$ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG
     - kustomize edit set image hotel-mlops-mlflow=$ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW:$IMAGE_TAG
+    - kustomize edit set image hotel-mlops-jobs=$ECR_REGISTRY/$ECR_REPOSITORY_JOBS:$IMAGE_TAG
     - cd "$CI_PROJECT_DIR"
     - git config user.email "gitlab-ci@hotel-mlops.local"
     - git config user.name "GitLab CI (GitOps release)"

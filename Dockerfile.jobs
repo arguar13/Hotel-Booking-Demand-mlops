@@ -1,0 +1,75 @@
+# The batch image: core_ml's code, packaged to run *inside* the cluster.
+#
+# Until this existed, training and every other core_ml entrypoint could only be
+# run from a developer's laptop against the MLflow load balancer - the repo
+# shipped three images (api, dashboard, mlflow) and none of them contained the
+# ML code. That made "run something on a schedule against production"
+# impossible, which is why the drift monitor needed this image before it needed
+# a single line of statistics.
+#
+# One image, several entrypoints. The drift CronJob overrides `command:` with
+# `python -m src.monitoring.drift_monitor`; a scheduled retrain would override
+# it with `python -m src.train` and need nothing else built. Splitting them into
+# separate images would mean two Dockerfiles, two ECR repositories and two
+# builds carrying byte-identical dependency layers.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    POETRY_VERSION=1.8.2
+
+WORKDIR /app
+
+# Optional local CA trust for machines where a corporate/AV proxy performs TLS
+# interception on outbound HTTPS - see Dockerfile (api) for the full rationale.
+# No-op everywhere the override file is absent, including CI.
+COPY docker/local-ca-placeholder.crt docker/local-c[a].crt /tmp/local-ca/
+RUN sh -c 'for f in /tmp/local-ca/*; do [ -s "$f" ] && cp "$f" /usr/local/share/ca-certificates/local-ca.crt; done; update-ca-certificates; rm -rf /tmp/local-ca'
+ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# libgomp1: scikit-learn's RandomForest is OpenMP-parallel and imports fail
+# without it on the slim base. It is a runtime library, not a build tool, so it
+# stays in the final image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir poetry==$POETRY_VERSION
+
+# Dependencies first, from the same committed lockfile `make train` resolves
+# locally - the environment that produced a model is byte-for-byte the one that
+# monitors it. --no-root: core_ml declares `packages = [{include = "src"}]`, and
+# installing the project itself would only duplicate the source copied below.
+COPY core_ml/pyproject.toml core_ml/poetry.lock* ./
+RUN poetry config virtualenvs.create false \
+    && poetry install --only main --no-interaction --no-ansi --no-root
+
+# WORKDIR is /app and src.config_loader resolves "config/config.yaml" relative
+# to the working directory, so the layout here has to mirror core_ml/'s own.
+COPY core_ml/src/ ./src/
+COPY core_ml/config/ ./config/
+COPY core_ml/scripts/ ./scripts/
+
+# Provenance without shipping git in the runtime image. src/traceability.py
+# prefers CI_COMMIT_SHA and only shells out to `git` as a local-development
+# fallback, so baking the commit in at build time gives every drift run the same
+# git_commit_hash tag a training run gets - and avoids installing git (and its
+# dependency surface) into an image that runs unattended in the cluster.
+# GIT_PYTHON_REFRESH: mlflow imports GitPython, which logs a multi-line warning
+# on every start when no git binary exists. Nothing here needs it.
+ARG GIT_COMMIT_SHA=local-dev
+ENV CI_COMMIT_SHA=${GIT_COMMIT_SHA}
+ENV GIT_PYTHON_REFRESH=quiet
+
+# Unprivileged user - UID 1000 is fixed to match the securityContext in
+# kubernetes/base/drift-monitor-cronjob.yaml, which sets runAsNonRoot and would
+# have the kubelet refuse the pod outright if this image ever regressed to root.
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+ENV HOME=/home/appuser
+
+# Overridden per workload; this is the one that runs on a schedule today.
+CMD ["python", "-m", "src.monitoring.drift_monitor"]

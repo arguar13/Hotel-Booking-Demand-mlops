@@ -53,9 +53,10 @@ graph TD
 
         subgraph VPC - Private Network
             I[Amazon EKS - Kubernetes Cluster]
-            J[(Amazon RDS - PostgreSQL 18.3)]
+            J[(Amazon RDS - PostgreSQL 18.3<br/>MLflow store + prediction log)]
             ARGO[ArgoCD]
             ESO[External Secrets Operator]
+            CRON["drift-monitor CronJob<br/>daily, in-cluster"]
         end
 
         K[(Amazon S3 - ML Artifacts)]
@@ -63,6 +64,9 @@ graph TD
 
         I -->|OIDC / IRSA| K
         I -->|Security Group Whitelist| J
+        I -.->|prediction log + ground-truth labels| J
+        CRON -->|reads window, joins labels| J
+        CRON -->|reads the served version's baseline,<br/>writes the drift report| K
         ARGO -->|Pulls & reconciles, self-heal| REPO
         ARGO -->|Deploys| I
         ESO -->|Reads, materializes Secret| SM
@@ -83,7 +87,7 @@ Note the deliberate asymmetry: CI (top half of the diagram) only ever writes to 
 
 | Category | Tools | Purpose in this project |
 |---|---|---|
-| **Infrastructure as Code** | Terraform, AWS (VPC, EKS, RDS, S3, ECR, IAM/IRSA) | Declarative definition of the entire AWS topology, with remote state (S3 + DynamoDB lock) |
+| **Infrastructure as Code** | Terraform, AWS (VPC, EKS, RDS, S3, ECR, IAM/IRSA) | Declarative definition of the entire AWS topology, with versioned remote state in S3 and S3-native conditional-write locking |
 | **Container Orchestration** | Kubernetes (EKS), Kustomize | Declarative deployment manifests; a base + production overlay pattern for environment-specific values |
 | **GitOps & Delivery** | ArgoCD, External Secrets Operator | Pull-based, self-healing cluster reconciliation from Git; secrets synced declaratively from AWS Secrets Manager |
 | **CI/CD** | GitLab CI, OpenID Connect (OIDC) | Quality gate, security scanning, training smoke test, integration tests, image build/push, GitOps release commit — with no long-lived AWS credentials in CI |
@@ -93,8 +97,9 @@ Note the deliberate asymmetry: CI (top half of the diagram) only ever writes to 
 | **Messaging** | Apache Kafka | Optional, decoupled asynchronous feed of prediction events |
 | **Dashboard** | Streamlit | Human-facing exploration and demo interface |
 | **Local Development** | Docker Compose, VS Code DevContainers, LocalStack | The full stack, including a simulated AWS, runnable end-to-end on a laptop |
-| **Testing** | Pytest, Testcontainers | Fast unit tests plus hermetic, ephemeral integration tests against real Postgres/Kafka/LocalStack/API containers |
-| **Observability & Resilience** | structlog, tenacity, pybreaker | Structured JSON logs, bounded retries with backoff, a circuit breaker on the non-critical path |
+| **Testing** | Pytest, Testcontainers | Fast unit tests plus hermetic, ephemeral integration tests against real Postgres/Kafka/LocalStack/API containers — including a schema contract test that applies the API's real DDL to a throwaway Postgres and runs the drift monitor's real queries against it |
+| **Observability & Resilience** | structlog, tenacity, pybreaker | Structured JSON logs, bounded retries with backoff, circuit breakers on both non-critical paths |
+| **Drift Monitoring** | Kubernetes CronJob, PSI / Jensen-Shannon / bootstrap CIs (numpy), Postgres | Durable prediction log, delayed ground-truth ingestion, and a daily data / prediction / confidence / **concept** drift verdict recorded as an MLflow run |
 | **Code Quality & Security** | Ruff, Black, isort, mypy, Bandit, Trivy, detect-secrets, yamllint | Static analysis, typing, SAST, and IaC/secret/vulnerability scanning |
 | **Dependency Management** | Poetry | Per-service, cryptographically locked, reproducible environments |
 | **Machine Learning** | Scikit-learn, Imbalanced-learn (SMOTE), Optuna, Pandas | Model training, class-imbalance handling, automated hyperparameter search |
@@ -125,7 +130,7 @@ A **quality gate** then decides whether the run is servable: the model is promot
 
 ### Deployment Pipeline (CI/CD)
 
-The pipeline's stage order — `test → build → deploy` — is a structural guarantee, not a convention: `build-push-ecr` and `gitops-release` cannot run unless every job in `test` has already passed.
+The pipeline's stage order — `test → build → deploy` — is a structural guarantee, not a convention: `build-push-ecr` and `gitops-release` cannot run unless every job in `test` has already passed. Four images are built, not three: `api`, `dashboard`, `mlflow`, and `jobs` — the last one ([`Dockerfile.jobs`](Dockerfile.jobs)) packages `core_ml`'s code so it can run *inside* the cluster. Until it existed nothing on the training or monitoring side could run anywhere but a laptop, which is why the drift monitor needed it before it needed a single line of statistics.
 
 ```
 Push to main
@@ -135,7 +140,7 @@ Push to main
        ├─ train-smoke         → live clean→validate→tune→train→quality-gate run, toy dataset
        └─ integration-tests   → Testcontainers: Postgres, Kafka, LocalStack, the real API Dockerfile
   └─ build stage
-       └─ build-push-ecr      → build & push api / dashboard / mlflow images to Amazon ECR
+       └─ build-push-ecr      → build & push api / dashboard / mlflow / jobs images to Amazon ECR
   └─ deploy stage
        └─ gitops-release      → kustomize edit set image + git commit/push (commits to Git only)
 
@@ -143,6 +148,13 @@ ArgoCD (independent, in-cluster, polling Git) → pulls the new commit → recon
 ```
 
 Every job's `script:` is the same `make` target (`make ci`, `make train-toy`, `make test-integration`) a developer already ran locally via pre-commit or by hand — there is no CI-only logic that can drift from what was validated on a laptop. `gitops-release` itself never runs `kubectl apply` or touches AWS; it only commits an image-tag bump to Git. Authentication throughout uses GitLab's native OpenID Connect (OIDC) federated to a scoped IAM role (`terraform/iam.tf`), so no long-lived AWS access key is ever stored as a CI secret.
+
+
+### Monitoring Pipeline
+
+Training and serving are only two thirds of a model's lifecycle; the third is finding out whether the model is still right. Every prediction served in the cluster is written to a durable log with a correlation id, ground truth for those predictions is ingested through `POST /feedback` when the booking is reconciled, and a daily `CronJob` compares the two against the baseline that was logged with the serving model version. What it measures, why it is deliberately hard to trigger, and what it is not allowed to do are all in [Monitoring and Observability](#monitoring-and-observability) below.
+
+The important structural point is that this is the first workload here that is not a long-running service. It runs from a fourth image ([`Dockerfile.jobs`](Dockerfile.jobs)), reaches the cluster through exactly the same path as everything else — `kustomize edit set image`, a Git commit, ArgoCD — and consumes exactly the same `mlops-config` ConfigMap and `mlops-secrets` Secret the API does, so "where the monitoring store is" has one definition and it lives in Git.
 
 ---
 
@@ -158,7 +170,13 @@ Every job's `script:` is the same `make` target (`make ci`, `make train-toy`, `m
 
 **Ephemeral integration tests (Testcontainers) against a simulated cloud (LocalStack).** [`integration-tests/`](integration-tests) spins up real, short-lived containers to prove each moving part in isolation — the Postgres connection pattern MLflow's backend depends on, the Kafka produce/consume roundtrip the API's prediction feed depends on, the exact S3/SQS/Secrets Manager calls this project makes in production, and the real `Dockerfile` building and serving `/health`. LocalStack backs both this suite and the Docker Compose stack, so S3/SQS/Secrets Manager calls hit a local emulator rather than a real AWS account during development.
 
+**A contract test where a type checker cannot reach.** The two halves of the monitoring loop are separate Poetry projects that ship as separate images: `api/monitoring.py` owns the `monitoring.*` tables and writes to them, `core_ml/src/monitoring/store.py` only ever reads them back. Nothing at import time can catch the day someone renames a column on one side, and the consequence of that divergence is not a red test — it is a CronJob that starts failing at 04:00, or worse, one that quietly returns zero rows and reports "no drift" forever. [`test_monitoring_schema.py`](integration-tests/tests/test_monitoring_schema.py) closes that gap by extracting the real SQL constants out of both source files with `ast` (rather than importing the modules and dragging in mlflow, pandas, structlog and pybreaker to read four strings), applying the writer's own DDL to a throwaway Postgres container, writing through the writer's own `INSERT`s, and reading back through the reader's own `SELECT`s. A rename on either side fails in CI, on the commit that caused it.
+
 **GitOps with zero manual `kubectl apply` and zero `sed`.** Every raw text-substitution pattern from earlier iterations of this project has been replaced with a structural equivalent: `ExternalSecret` CRDs instead of `sed`-injected passwords, `kustomize edit set image` instead of `sed`-rewritten image tags, DVC's own CLI instead of `sed`-edited remote URLs. The cluster's desired state lives entirely under [`kubernetes/`](kubernetes), and [`gitops/argocd/application.yaml`](gitops/argocd/application.yaml) is the only thing that tells ArgoCD to reconcile it. Preview exactly what would be deployed, with no cluster access needed, via `make k8s-build`.
+
+**Configuration changes that actually reach running pods.** Non-secret configuration lives in [`kubernetes/base/mlops-config.env`](kubernetes/base/mlops-config.env) and is rendered by a Kustomize `configMapGenerator`, which appends a hash of the contents to the ConfigMap's name. Because `envFrom` values are only read when a container starts, a plain, statically named ConfigMap would let an edited value sit unnoticed until something else happened to restart the pod. A content hash changes the Deployment spec itself, so a config change is a rollout like any other.
+
+**Hardened workloads by default.** Every Deployment runs as a non-root user (UID 1000, baked into each Dockerfile) with `runAsNonRoot`, a read-only root filesystem, all Linux capabilities dropped, `allowPrivilegeEscalation: false`, and the `RuntimeDefault` seccomp profile. The few paths that genuinely need to be written — MLflow's artifact staging directory, the client cache under `$HOME`, Streamlit's run state — get an explicit `emptyDir` each, so "read-only" stays a real constraint instead of one relaxed away the first time something failed to start.
 
 ---
 
@@ -170,13 +188,53 @@ Every job's `script:` is the same `make` target (`make ci`, `make train-toy`, `m
 {"model_uri": "models:/HotelSegmentClassifier@staging", "event": "model_load_failed", "error": "...", "timestamp": "2026-08-25T21:48:11Z", "level": "error"}
 ```
 
-**Health and latency signal.** `/health` doubles as the Kubernetes readiness/liveness probe target and a machine-readable status endpoint: it reports whether a model is currently loaded (`model_loaded`) and the live state of the Kafka circuit breaker (`closed` / `open` / `half-open`), so a partial degradation is visible without reading logs.
+**Health and readiness are separate questions.** `/health` is the liveness target: it reports that the process itself is alive, along with whether a model is currently loaded (`model_loaded`), the alias being served, and the live state of the Kafka circuit breaker (`closed` / `open` / `half-open`) — so a partial degradation is visible without reading logs. It deliberately stays `200` when no model is loaded, because a missing model is not a reason to kill the container. `/ready` is the readiness target and answers the narrower question the load balancer cares about: it returns `503` until a model is actually loaded, keeping a replica out of the Service's endpoints instead of routing traffic to a pod that can only answer `503`. Collapsing both onto one endpoint is precisely what used to let a rollout leave the API dead behind a pod Kubernetes considered healthy.
 
-**Bounded failure instead of cascading failure.** Loading the model from the MLflow Registry at startup retries with capped exponential backoff (`tenacity`, at most 3 attempts) rather than hanging indefinitely — a pod that cannot reach the registry finishes starting and reports `model_loaded: false` instead of never becoming ready. The optional Kafka prediction-event publish is wrapped in a circuit breaker (`pybreaker`) that opens after 5 consecutive failures and stays open for 30 seconds, so a downed broker degrades a non-critical side channel instead of adding a connection-timeout to every `/predict` request. Both mechanisms are covered by tests ([`api/tests/test_api.py`](api/tests/test_api.py)) that simulate a failing Kafka and assert the breaker opens and the request path never raises.
+**Bounded failure instead of cascading failure.** Loading the model from the MLflow Registry at startup retries with capped exponential backoff (`tenacity`, at most 3 attempts) rather than hanging indefinitely — a pod that cannot reach the registry finishes starting and reports `model_loaded: false` instead of never becoming ready. Because every rollout restarts the `mlflow` and `api` Deployments at the same time, exhausting those three attempts is routine rather than exceptional, so a background loader keeps retrying every `MODEL_RETRY_SECONDS` (15s by default) for as long as there is no model, with `/ready` returning `503` throughout. The same loop re-reads the alias every `MODEL_REFRESH_SECONDS` (300s in the cluster), so a newly promoted model version is picked up without a pod restart. That setting used to be an optimization, off by default; drift monitoring made it load-bearing. The monitor evaluates whichever version the alias currently resolves to and filters the prediction log by it, so an API still serving the previous version would produce a window with zero matching rows and a permanent `SKIPPED` verdict — a monitor that looks healthy while measuring nothing. MLflow's own client-side retry layer is dialled down to a single attempt (`MLFLOW_HTTP_REQUEST_MAX_RETRIES=1`) so it cannot compound with this one and turn a few bounded seconds into minutes of invisible backoff. The optional Kafka prediction-event publish is wrapped in a circuit breaker (`pybreaker`) that opens after 5 consecutive failures and stays open for 30 seconds, so a downed broker degrades a non-critical side channel instead of adding a connection-timeout to every `/predict` request. Both mechanisms are covered by tests ([`api/tests/test_api.py`](api/tests/test_api.py)) that simulate a failing Kafka and assert the breaker opens and the request path never raises.
 
-**Prediction audit trail.** Every successful prediction is optionally published as an event to Kafka's `predictions` topic (booking features, predicted segment, model name and alias, timestamp) — a fire-and-forget, decoupled feed that never blocks or fails the HTTP response, and the natural foundation for a future drift-detection consumer.
+**Prediction audit trail — durable, and actually running in production.** Every prediction is persisted to `monitoring.predictions` in the same RDS instance MLflow already uses: a `prediction_id` returned to the caller, the model *version* that produced it, the full feature vector as JSONB, and the classifier's top-class probability and its margin over the runner-up. The write never enters the request path — records go onto a bounded in-memory queue and are flushed in batches by a background task, behind the same circuit breaker already proven around the Kafka publish — so a dead database costs observability data and never a prediction. `/health` reports queue depth, rows written and rows dropped, because a starved sink must be visible *before* it produces a confident drift verdict over an unrepresentative sample.
 
-**Deliberately out of scope today.** There is no Prometheus/Grafana metrics stack and no automated data or concept drift detection (e.g., Evidently AI) wired up yet. The Kafka prediction feed above, together with the full traceability tags already attached to every MLflow run, are exactly the groundwork such a service would consume — adding it is the natural next increment once the model is serving real production traffic rather than a portfolio-scale volume.
+> An earlier version of this document described the Kafka `predictions` topic as this audit trail. That was not true of production: there is no broker in the EKS cluster and `KAFKA_BOOTSTRAP_SERVERS` is unset there, so that feed only ever ran under `docker compose` — in the cluster, predictions went to stdout and were lost. Kafka is retained as an optional local side channel; the durable record is the Postgres write above. Standing a broker up in EKS to move a few thousand rows a day would have contradicted this project's own trade-off against streaming infrastructure the volume does not justify.
+
+**Ground truth — the delayed-label loop.** `POST /feedback` records the true market segment for previously served predictions, keyed on `prediction_id`. This is the half that makes *concept* drift measurable at all, and it exists because in this domain the truth is genuinely knowable: a booking's segment is settled when the reservation is reconciled against its channel of record, hours to days after the prediction was served. That is what a nightly reconciliation job posts, in batches. Unlike `/predict`, this write is synchronous and idempotent — labels are low-volume and worthless if silently dropped, and a batch job that cannot tell whether its labels landed will eventually compute accuracy over a biased sample.
+
+**Drift monitoring — four questions, only one of which is concept drift.** A Kubernetes `CronJob` ([`drift-monitor-cronjob.yaml`](kubernetes/base/drift-monitor-cronjob.yaml)) runs [`core_ml/src/monitoring/`](core_ml/src/monitoring) once a day over one window and records its verdict as an MLflow run:
+
+| Question | What moved | Needs labels? |
+|---|---|---|
+| **Data drift** | P(X) — per-feature PSI against the training baseline, plus missing-rate change | no |
+| **Prediction drift** | P(ŷ) — the mix of predicted segments | no |
+| **Confidence drift** | mean top-class probability, and the margin over the runner-up | no |
+| **Concept drift** | **P(y&#124;X) — is the model still _right_?** | **yes** |
+
+Only the last is concept drift in the strict sense, and it is the only one allowed to raise `ALERT` on its own. The other three are early warning during the reconciliation delay; treating them as alerts is how a monitor ends up paging someone for a seasonal shift in booking mix. Conflating the four is the most common way "drift monitoring" ends up reporting confidently on a model's *inputs* while the model quietly gets worse.
+
+**The baseline travels with the model.** Drift is a comparison, so it needs a reference that is immutable and precisely identified. Training logs one — feature histograms, the target mix, and the held-out F1, accuracy, confidence and margin — as `monitoring/reference_profile.json`, an artifact of the model's own MLflow run. The monitor resolves the serving alias, downloads that version's profile, and compares. No DVC, no dataset, no bucket scan: a few kilobytes of histograms that cannot silently change under a model that never retrained. It is the same pattern SageMaker Model Monitor's baselining job and Vertex AI's skew detection use, for the same reasons.
+
+**Why it is deliberately hard to trigger.** A monitor that cries wolf is switched off within a fortnight, and a switched-off monitor is worse than none because it is still believed. Three mechanisms:
+
+- **A sample-size guard.** Below `min_predictions` / `min_labelled` the run reports `SKIPPED`, never "no drift" — "we could not tell" and "we checked and it is fine" call for opposite responses.
+- **Effect sizes, not p-values.** PSI (the standard 0.10 / 0.25 bands) and Jensen–Shannon distance, not chi-square or KS. With tens of thousands of predictions a hypothesis test rejects the null on differences nobody would act on; an effect size answers the question an operator can act on.
+- **Hysteresis.** A single alerting window is recorded but does not escalate. `consecutive_alerts_required` windows on the same model version must agree first — read back out of MLflow's own run history rather than from a second store to keep consistent.
+
+For concept drift specifically, `ALERT` requires the drop to be both **material** (at least `f1_alert_tolerance` below the baseline) and **conclusive** (the whole bootstrap 95% interval for live F1 sitting below the baseline). A drop that is material but not conclusive is a `WARN`: the right response is to wait for more labels, not to pull a model that may be fine.
+
+**Statistics implemented here rather than imported.** PSI, Jensen–Shannon and the bootstrap interval are forty lines of numpy in [`statistics.py`](core_ml/src/monitoring/statistics.py). A drift alert is an operational claim about a production model, and when someone asks six months later why version 7 was pulled, the answer has to be a formula and a threshold that were both under version control at the time — not "the library said so", where the binning strategy and default thresholds may have moved across a minor release. It also keeps a large transitive dependency graph, and its rendering stack, out of a `make security` gate that fails the build on any HIGH or CRITICAL finding.
+
+**It never retrains or promotes anything.** The job's authority ends at recording a finding and exiting non-zero on a confirmed `ALERT`, which marks the Job failed — a signal Kubernetes already surfaces everywhere, so this project owns no alerting channel of its own. Closing the loop automatically would let a data-quality incident upstream promote a model trained on that incident, with no human in between. Retraining is a decision; this is the evidence for it.
+
+**A backtest against drift that actually happened.** [`scripts/replay_bookings.py`](core_ml/scripts/replay_bookings.py) replays real bookings through `/predict` and posts their real segments to `/feedback`. The dataset spans 2015-07 to 2017-08 and its booking mix genuinely shifts over that period, so setting `train_max_year: 2016` and replaying 2017 measures the monitor against a shift that really happened rather than against injected noise. Measured on the local stack:
+
+| Window | Predictions / labelled | Live weighted F1 (95% CI) | Baseline | Features drifted | Concept drift |
+|---|---|---|---|---|---|
+| 2016 (in-period) | 1500 / 1200 | 0.9374 [0.9232, 0.9494] | 0.9267 | 3% | `OK` |
+| 2017 (out-of-period) | 2000 / 1600 | 0.8982 [0.8842, 0.9121] | 0.9267 | 13% | `OK` |
+
+The 2017 window is the instructive one. The inputs moved measurably — 13% of features, with `adr` up from a mean of 99 to 120 and the arrival-month distribution shifted — and live F1 fell by 0.0285 with the *entire* confidence interval below the baseline, so the degradation is real and statistically conclusive. It is nevertheless below the 0.03 tolerance, so the monitor correctly declines to escalate. Data drift is not concept drift, and this system is built to tell the difference.
+
+That first run also surfaced a genuine train/serve skew nobody had noticed: `company` and `agent` are null for most training rows but default to `0.0` in the API's request schema, so a client that omits them sends a value the model never trained on. It is reported as an explicit `missing 94% -> 0%` finding rather than as an unexplained PSI of 5.6.
+
+**Deliberately out of scope today.** There is still no Prometheus/Grafana metrics stack — four numbers a day about one model belong in MLflow, which is already this project's system of record for exactly that, rather than in a second observability plane to operate and secure. There is also no automated retraining trigger, for the reason given above. And ground truth here is replayed from the dataset rather than arriving from a real reservation system, which is the one part of this loop a production deployment would have to supply for itself.
 
 ---
 
@@ -184,13 +242,33 @@ Every job's `script:` is the same `make` target (`make ci`, `make train-toy`, `m
 
 Senior engineering is judged as much by what was deliberately not built as by what was. Each choice below was made under a real constraint, and each carries a cost that was accepted knowingly rather than discovered later.
 
-**Synchronous REST inference (FastAPI) over batch or streaming scoring.** The business need is to know a booking's market segment at the moment it enters the system, so pricing and personalization logic downstream can act on it immediately — a nightly batch job would be cheaper to run but introduces a latency window that is unacceptable for that use case, while a full streaming architecture (e.g., a Kafka Streams/Flink job consuming bookings and emitting predictions) would solve latency at a level of infrastructure and operational complexity the current request volume does not justify. The implemented compromise is synchronous request/response for the prediction itself, with an optional, fully decoupled Kafka feed for everything that *can* tolerate asynchronous delivery — audit logging, and eventually drift monitoring.
+**Synchronous REST inference (FastAPI) over batch or streaming scoring.** The business need is to know a booking's market segment at the moment it enters the system, so pricing and personalization logic downstream can act on it immediately — a nightly batch job would be cheaper to run but introduces a latency window that is unacceptable for that use case, while a full streaming architecture (e.g., a Kafka Streams/Flink job consuming bookings and emitting predictions) would solve latency at a level of infrastructure and operational complexity the current request volume does not justify. The implemented compromise is synchronous request/response for the prediction itself, with everything that *can* tolerate asynchronous delivery moved off the request path: the prediction log is a non-blocking enqueue flushed in batches (see Monitoring below), and an optional Kafka feed remains for local consumers that want predictions as a stream.
+
+**A Postgres prediction log over the Kafka topic the API already publishes to.** The obvious sink for inference logging was the `predictions` topic that already existed — except it only ever existed under `docker compose`. Deploying a broker into EKS to move a few thousand rows a day would have contradicted the streaming trade-off two paragraphs above, and an object-store append log cannot answer the query the monitor actually asks: "the predictions served in this window, joined to whatever ground truth has arrived for them". RDS is already provisioned, already reachable, already credentialed for the API pod through `mlops-secrets`, and it does the join. The accepted cost is that the serving path now touches a database — paid for with a bounded, non-blocking queue, batched flushes on a background task, a circuit breaker, and at-most-once delivery: losing a handful of rows to a hard pod kill is acceptable for a statistic computed over thousands, and buying at-least-once would have put the serving path back into the dependency chain the whole design exists to keep it out of.
+
+**Drift statistics implemented rather than imported (no Evidently).** A drift finding is an operational claim that has to be reproducible from documented inputs months later, which argues for a formula and a threshold under version control rather than a library whose binning strategy and defaults can move across a minor release. PSI, Jensen–Shannon and a percentile bootstrap are forty lines of numpy, and keeping them here also keeps a large transitive dependency graph out of a `make security` gate that fails the build on any HIGH or CRITICAL finding. The accepted cost is the rendering: no interactive report, just a self-contained HTML artifact with proportional bars, which is also all that MLflow's artifact viewer can serve without a CDN.
+
+**Effect sizes with fixed bands over hypothesis tests.** With a window of tens of thousands of predictions, chi-square or KS rejects the null on differences far too small to change any decision — the classic failure mode that makes a p-value-driven monitor cry wolf nightly until somebody silences it. PSI's 0.10 / 0.25 bands are an industry-standard vocabulary, so "PSI 0.31 on `lead_time`" needs no local explanation to be actionable. The one place inference genuinely belongs is the concept-drift verdict, where a labelled window really is a sample, and there the bootstrap confidence interval has to sit entirely below the baseline before anything escalates.
+
+**A baseline profile logged with the model, not the training dataset re-read.** The alternative — have the monitor `dvc pull` the training data — needs DVC and bucket credentials in a batch pod, downloads tens of megabytes to throw away, and leaves nothing preventing the reference from silently changing under a model that never retrained. Logging a few kilobytes of histograms as an artifact of the training run makes the baseline immutable and reachable from the model version alone. The accepted cost is that a model trained before this existed has no baseline; the monitor reports that as `SKIPPED` with "retrain to publish one" rather than crashing.
+
+**A Kubernetes CronJob over a workflow engine.** One container, once a day, no fan-out and no inter-task dependencies. Airflow, Argo Workflows or Step Functions would each add a control plane to operate, upgrade and secure in exchange for scheduling semantics Kubernetes already has — the same reasoning that kept Kustomize instead of Helm for this repository's own manifests. When there is a second task with a real dependency on the first, that trade changes.
+
+**Drift reports as MLflow runs, not a Prometheus/Grafana stack.** These are four numbers a day about one model, already tied to the model version and the run that produced it, and MLflow is already this project's system of record for exactly that — it even plots one feature's PSI across every window, which is the view that turns "PSI is 0.3 today" into "PSI has been climbing for a week". A metrics stack would be a second observability plane to operate and secure for no question it could answer that this cannot. The accepted cost is no alertmanager: a confirmed `ALERT` exits non-zero instead, which marks the Job failed and surfaces through whatever already watches Kubernetes job failures.
+
+**Detection without automatic retraining.** Closing the loop — drift fires, model retrains, alias moves — is the demo everyone wants and the design nobody should ship. It lets a data-quality incident upstream promote a model trained on that incident, with no human between the two, and it makes the quality gate the only thing standing between a bad day and production. The job's authority therefore ends at recording a finding and failing loudly. Retraining is a decision; this system produces the evidence for it.
+
+**A separate IAM identity for batch workloads.** `jobs-sa` gets its own IRSA role rather than borrowing `api-sa`'s, even though today they need exactly the same S3 permissions. They are different workloads with different blast radii and different lifecycles, and sharing the role would mean every permission a future batch job needs is silently granted to the internet-facing API as well. The accepted cost is one more Terraform module and one more annotation to fill in after `terraform apply`.
 
 **FastAPI over Flask.** FastAPI's ASGI foundation (Uvicorn) supports concurrent I/O-bound work — the internal Kafka publish today, other outbound calls tomorrow — without a separate worker-pool story, and Pydantic-based request/response validation plus an auto-generated OpenAPI schema replace what would otherwise be hand-written marshalling and hand-maintained API docs. For a single-model prediction endpoint, that was worth the small added conceptual surface over Flask's simplicity.
 
-**MLflow Model Registry aliases as the only path to a servable model — no `model.joblib` in the repository or the image.** Baking a serialized model into the Docker image couples every model update to a full image rebuild and redeploy. Loading from the registry by alias (`models:/HotelSegmentClassifier@staging`) decouples "ship a new model version" from "ship a new version of the application" — promoting a model is a metadata operation (`set_registered_model_alias`), not a CI/CD run. The accepted cost is a runtime dependency: the API is unable to serve if the registry is unreachable at startup, which is exactly why model loading is wrapped in a bounded retry and `/health` reports the failure explicitly instead of the pod crashing.
+**MLflow Model Registry aliases as the only path to a servable model — no `model.joblib` in the repository or the image.** Baking a serialized model into the Docker image couples every model update to a full image rebuild and redeploy. Loading from the registry by alias (`models:/HotelSegmentClassifier@staging`) decouples "ship a new model version" from "ship a new version of the application" — promoting a model is a metadata operation (`set_registered_model_alias`), not a CI/CD run. The accepted cost is a runtime dependency: the API is unable to serve if the registry is unreachable at startup, which is exactly why model loading is wrapped in a bounded retry, kept alive by a background loader, and reported explicitly through `/ready` instead of the pod crashing.
 
 **GitOps (ArgoCD, pull-based) over CI running `kubectl apply` (push-based).** A push-based pipeline is simpler and has zero reconciliation lag, but it requires CI to hold live cluster credentials — a large blast radius for a CI runner to carry. Pull-based GitOps confines CI's blast radius to Git and ECR; ArgoCD, running inside the cluster with its own scoped access, is the only thing that ever mutates it, and it self-heals manual drift automatically. The accepted trade-off is a small window between merge and rollout (ArgoCD's sync interval) instead of an immediate push.
+
+**A separate, minimal Terraform configuration for the identity everything else runs as.** [`terraform/bootstrap/`](terraform/bootstrap/main.tf) creates exactly one IAM user (`hotel-mlops-terraform-automation`) in its own local state, applied once with the account root key; every other `terraform` command in this repository then runs as that user's CLI profile. The reason it is not simply another `.tf` file alongside the rest is a failure mode that only appears on teardown: a `terraform destroy` that includes the identity performing the destroy deletes it partway through its own run, and every remaining API call fails with `InvalidClientTokenId` — stranding EKS, RDS and the VPC half-deleted behind a stuck state lock. An identity must not live in the state it is being used to destroy. The accepted costs are a two-step bootstrap and a local `terraform.tfstate` holding a secret access key (gitignored, and disposable once the CLI profile is configured) — itself deliberate, since putting those credentials' state in the S3 bucket they exist to unlock is the same circular dependency one level up.
+
+**Adopting account-wide AWS resources instead of owning them.** This project shares an AWS account with other work, and an IAM OIDC provider is a singleton per issuer URL for the *entire account*, not per Terraform state: a second `resource` block for `https://gitlab.com` fails with `EntityAlreadyExists` the moment a sibling project has registered it first, and managing it here would mean a `terraform destroy` in this repository silently breaking their CI. It is read as a `data` source instead, so this configuration adopts whichever provider already exists without ever creating or destroying something another project depends on. Every resource this configuration *does* own is prefixed with `project_name` for the same reason — IAM role names are unique per account, and the CI role was previously a bare `GitLabCIRole` that collided with an identically named role from another project.
 
 **Kustomize over Helm for this repository's own manifests.** With exactly one environment (production) and a handful of environment-specific values (image tags, DB host, bucket name), a templating engine's parameterization is unneeded complexity — Kustomize's structural patches (`kustomize edit set image`) are enough, and they keep the base manifests plain, readable Kubernetes YAML. Helm is still used, deliberately, for the two pieces of infrastructure that genuinely are third-party and versioned upstream: ArgoCD and the External Secrets Operator, both installed via `helm_release` in Terraform.
 
@@ -198,7 +276,7 @@ Senior engineering is judged as much by what was deliberately not built as by wh
 
 **RandomForest + Optuna over a deep learning model.** The dataset is tabular, with a moderate number of categorical and numeric features — the class of problem where tree ensembles typically match or beat deep networks, train in seconds rather than GPU-hours, and load reliably into a synchronous request path. Optuna adds automated hyperparameter search on top of that baseline without paying for a heavier training framework or a GPU-aware serving story.
 
-**GitLab CI over GitHub Actions.** The pipeline itself runs on GitLab CI — this repository is mirrored to GitHub as a portfolio artifact. The deciding factor was GitLab's native OIDC federation to AWS IAM (`aws_iam_openid_connect_provider` in `terraform/iam.tf`), which removes the need for any long-lived AWS access key stored as a CI secret; an equivalent exists for GitHub Actions, but the pipeline predates that specific migration, and the underlying security property — no static credentials in CI — is identical either way.
+**GitLab CI over GitHub Actions.** The pipeline itself runs on GitLab CI — this repository is mirrored to GitHub as a portfolio artifact. The deciding factor was GitLab's native OIDC federation to AWS IAM (`data.aws_iam_openid_connect_provider` in `terraform/iam.tf`), which removes the need for any long-lived AWS access key stored as a CI secret; an equivalent exists for GitHub Actions, but the pipeline predates that specific migration, and the underlying security property — no static credentials in CI — is identical either way.
 
 ---
 
@@ -284,18 +362,46 @@ Run the ephemeral Testcontainers suite (separate from the long-running stack abo
 make test-integration
 ```
 
-### 6. Deploying Infrastructure
+### 6. The Monitoring Loop (locally, end to end)
 
-One-time bootstrap of the remote state backend:
+With the stack from step 5 running and a model trained and aliased, the whole loop can be exercised on a laptop — the drift job runs from the same image and the same entrypoint the production `CronJob` uses:
+
+| Command | What it does |
+|---|---|
+| `make replay` | Replays 3,000 real 2016 bookings through `/predict`, then reconciles 80% of them through `/feedback` |
+| `make replay-drift` | Replays real 2017 bookings — the period where the booking mix actually shifted |
+| `make drift-report` | Runs the drift monitor (`Dockerfile.jobs`) against the window and records the verdict as an MLflow run |
+
+The report lands in the MLflow UI under the `hotel_market_segmentation_monitoring` experiment: metrics (`concept_live_f1`, `concept_baseline_f1`, `drift_share`, one `psi_<feature>` per feature) plus `drift/drift_report.html` and `drift/drift_report.json` as artifacts.
+
+To reproduce the backtest in [Monitoring and Observability](#monitoring-and-observability) — a baseline that genuinely predates the data being replayed — set `train_max_year: 2016` in [`config.yaml`](core_ml/config/config.yaml), run `make train`, then `make replay-drift` and `make drift-report`. Left at `null`, training uses the whole dataset and 2017 traffic is in-distribution by construction.
+
+The monitor is honest about having nothing to say: below `min_predictions` (500) or `min_labelled` (300) it reports `SKIPPED` with the reason, rather than an all-clear it has not earned.
+
+### 7. Deploying Infrastructure
+
+**Step 0 — the bootstrap identity (once, with the account root key).** Everything below runs as a dedicated IAM user rather than the root key, and that user is created by its own small Terraform configuration with its own local state — see [`terraform/bootstrap/main.tf`](terraform/bootstrap/main.tf) for why it deliberately does not live alongside the infrastructure it creates.
 
 ```bash
-aws s3api create-bucket --bucket hotel-mlops-tfstate-<account-id> --region us-east-1
-aws dynamodb create-table --table-name hotel-mlops-tfstate-lock \
-  --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH --billing-mode PAY_PER_REQUEST
+cd terraform/bootstrap
+AWS_ACCESS_KEY_ID=<root> AWS_SECRET_ACCESS_KEY=<root> terraform init
+AWS_ACCESS_KEY_ID=<root> AWS_SECRET_ACCESS_KEY=<root> terraform apply
+
+aws configure set aws_access_key_id     "$(terraform output -raw automation_user_access_key_id)"     --profile hotel-mlops
+aws configure set aws_secret_access_key "$(terraform output -raw automation_user_secret_access_key)" --profile hotel-mlops
+aws configure set region                us-east-1                                                    --profile hotel-mlops
 ```
 
-Then, from `terraform/`:
+**Step 1 — the remote state backend (once).** `terraform/provider.tf` declares `backend "s3" {}` with no values ("partial configuration"), because the state bucket has to exist before the configuration that would otherwise create it. Bucket versioning is what makes a corrupted or truncated state recoverable. There is no DynamoDB lock table: locking uses S3's own conditional writes (`use_lockfile`), which needs no second resource to provision, pay for, or keep in sync with the bucket — `dynamodb_table` has been deprecated since Terraform 1.11.
+
+```bash
+export AWS_PROFILE=hotel-mlops
+aws s3api create-bucket --bucket hotel-mlops-tfstate-<account-id> --region us-east-1
+aws s3api put-bucket-versioning --bucket hotel-mlops-tfstate-<account-id> \
+  --versioning-configuration Status=Enabled
+```
+
+**Step 2 — the infrastructure.** Set `gitlab_project_path` in [`terraform/terraform.tfvars`](terraform/terraform.tfvars) to your own GitLab project path first: it is what scopes the OIDC trust policy to your pipeline, and CI cannot assume the role while it is left at the `CHANGE_ME/hotel-mlops` default.
 
 ```bash
 make tf-fmt
@@ -303,21 +409,43 @@ terraform -chdir=terraform init \
   -backend-config="bucket=hotel-mlops-tfstate-<account-id>" \
   -backend-config="key=hotel-mlops/terraform.tfstate" \
   -backend-config="region=us-east-1" \
-  -backend-config="dynamodb_table=hotel-mlops-tfstate-lock"
+  -backend-config="use_lockfile=true"
 make tf-validate
-terraform -chdir=terraform plan
+make tf-plan
 terraform -chdir=terraform apply
 ```
 
 This provisions the VPC/EKS/RDS/S3/ECR/IAM *and* bootstraps ArgoCD and External Secrets Operator into the cluster via Helm.
 
-### 7. GitOps Bootstrap
+Teardown runs in the reverse order, for the same reason the bootstrap is split: `terraform -chdir=terraform destroy` as the automation profile first, then `terraform/bootstrap` on its own with the root key.
 
-After `terraform apply`, point ArgoCD at this repository once:
+### 8. GitOps Bootstrap
+
+`terraform apply` produces the handful of values the production overlay cannot know in advance. They change only when the infrastructure does, so unlike image tags (which CI rewrites on every build) they are set by hand, once:
+
+```bash
+terraform -chdir=terraform output rds_endpoint          # -> DB_HOST
+terraform -chdir=terraform output s3_bucket_name        # -> S3_BUCKET_NAME
+terraform -chdir=terraform output mlflow_iam_role_arn   # -> mlflow-sa annotation
+terraform -chdir=terraform output api_iam_role_arn      # -> api-sa annotation
+terraform -chdir=terraform output jobs_iam_role_arn     # -> jobs-sa annotation (drift-monitor CronJob)
+```
+
+`DB_HOST` and `S3_BUCKET_NAME` go in [`kubernetes/overlays/production/mlops-config.env`](kubernetes/overlays/production/mlops-config.env); the three IRSA role ARNs go in [`patch-service-account-arns.yaml`](kubernetes/overlays/production/patch-service-account-arns.yaml).
+
+Then point ArgoCD at this repository once:
 
 ```bash
 kubectl apply -f gitops/argocd/application.yaml
 ```
+
+One value is only knowable after the cluster is running. MLflow >=3 rejects any request whose `Host` header is not on its `--allowed-hosts` list (it reads an unrecognized host as a possible DNS-rebinding attack), and the Load Balancer hostname for `mlflow-service` is assigned by AWS only once the Service exists. Until it is added, in-cluster traffic works but the MLflow UI answers `403` through the ELB — and a fresh Service means a fresh hostname, so this is repeated after any teardown and rebuild:
+
+```bash
+kubectl get svc mlflow-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+Append that hostname and `<hostname>:5000` to `MLFLOW_ALLOWED_HOSTS` in the production overlay, then commit — the hashed `configMapGenerator` is what makes ArgoCD roll the pods for a ConfigMap-only change.
 
 From here on, pushing to `main` runs the full CI/CD pipeline described above, and ArgoCD rolls out the result on its own.
 
@@ -356,9 +484,38 @@ curl -X 'POST' \
 
 ```json
 {
-  "predicted_market_segment": "Direct"
+  "predicted_market_segment": "Direct",
+  "prediction_id": "6f1c3f2a-6b1e-4a9e-9a8d-1f0f0f4a2b77",
+  "model_version": "7",
+  "confidence": 0.92,
+  "margin": 0.84
 }
 ```
+
+`prediction_id` is the contract that makes concept-drift monitoring possible: quote it back once the booking's true segment is known and this prediction joins the labelled sample the monitor scores. `confidence` is the winning class probability and `margin` its gap to the runner-up — a model can stay confident while flipping between two classes it can no longer separate, and only the margin shows that.
+
+```http
+POST /feedback
+```
+
+```bash
+curl -X 'POST' \
+  'http://<LOAD_BALANCER_IP>:8000/feedback' \
+  -H 'Content-Type: application/json' \
+  -d '[
+    {
+      "prediction_id": "6f1c3f2a-6b1e-4a9e-9a8d-1f0f0f4a2b77",
+      "actual_market_segment": "Online TA",
+      "label_source": "reconciliation"
+    }
+]'
+```
+
+```json
+{ "accepted": 1, "skipped": 0 }
+```
+
+A batch endpoint, because ground truth arrives from a reconciliation job rather than from the caller of `/predict`. It is an idempotent upsert, so re-posting a batch is safe — and necessary: `skipped` counts rows whose prediction had not yet been flushed to the log (predictions are persisted asynchronously so `/predict` stays fast), which the caller re-posts. A `skipped` count that survives retries means those ids were never served.
 
 ---
 
@@ -367,6 +524,7 @@ curl -X 'POST' \
 ```text
 hotel-booking-mlops/
 ├── .devcontainer/           # Isolated VS Code environment definitions
+├── .gitattributes           # Forces LF on shell/YAML/Makefile so a Windows checkout still passes `make ci`
 ├── .pre-commit-config.yaml  # Shift-left git hooks (lint, format, type-check, test, secrets, YAML)
 ├── .yamllint.yml            # YAML style/validity rules for CI + Kubernetes manifests
 ├── .secrets.baseline        # detect-secrets audited baseline (blocks new secrets only)
@@ -374,6 +532,8 @@ hotel-booking-mlops/
 ├── api/                     # FastAPI inference microservice (own pyproject.toml + poetry.lock)
 │   ├── pyproject.toml
 │   ├── poetry.lock
+│   ├── schemas.py           # Pydantic request/response contracts, incl. prediction_id and the /feedback batch
+│   ├── monitoring.py        # Inference log + ground-truth sink (bounded queue, batched flush, breaker)
 │   └── tests/
 ├── core_ml/                 # Training pipeline, data processing, Streamlit dashboard
 │   ├── pyproject.toml
@@ -381,37 +541,45 @@ hotel-booking-mlops/
 │   ├── .dvc/                # DVC project root (`dvc init --subdir`), S3 remote config
 │   ├── dvc.yaml             # Data-cleaning pipeline stages (full + toy)
 │   ├── dvc.lock             # Content hashes for every stage's deps/outs
+│   ├── config/config.yaml   # Data paths, training period, Optuna trials, quality-gate threshold, registry name/alias, drift thresholds
 │   ├── data/                # Raw + processed CSVs - DVC-tracked, gitignored
 │   │   └── toy/             # ~1000-row deterministic sample for fast local runs
-│   ├── scripts/             # One-off tooling (make_toy_dataset.py)
+│   ├── scripts/             # One-off tooling (make_toy_dataset.py, replay_bookings.py)
 │   ├── src/                 # data_contracts.py, data_processing.py, train.py, traceability.py
+│   │   └── monitoring/      # Drift monitor: profile, statistics, store, report, drift_monitor (CronJob entrypoint)
 │   ├── dashboard/
 │   └── tests/
 ├── integration-tests/       # Testcontainers: ephemeral Postgres/Kafka/LocalStack/API container tests
 │   ├── pyproject.toml
 │   ├── poetry.lock
-│   └── tests/
+│   └── tests/               # incl. test_monitoring_schema.py - the writer's DDL vs the monitor's queries, on real Postgres
 ├── localstack-init/         # Scripts LocalStack runs on startup (creates S3 buckets, SQS queue, secret)
+├── docker/                  # Optional local CA cert for TLS-intercepting proxies (empty placeholder by default)
 ├── kubernetes/              # Desired cluster state - GitOps source of truth for ArgoCD
-│   ├── base/                # Deployments, Services, ConfigMap, ExternalSecret, ClusterSecretStore
+│   ├── base/                # Deployments, Services, drift-monitor CronJob, ExternalSecret, ClusterSecretStore, mlops-config.env
 │   └── overlays/
-│       └── production/      # Image tags + env-specific patches (kustomize edit set image/...)
+│       └── production/      # Image tags, IRSA role ARNs, env-specific config (kustomize edit set image/...)
 ├── gitops/
 │   └── argocd/
 │       └── application.yaml # ArgoCD Application: reconciles kubernetes/overlays/production
 ├── terraform/               # Modular Infrastructure as Code
-│   ├── ecr.tf               # Container registries (api, dashboard, mlflow) and lifecycle policies
+│   ├── bootstrap/           # Separate config + local state: the one-time IAM identity everything else runs as
+│   ├── ecr.tf               # Container registries (api, dashboard, mlflow, jobs) and lifecycle policies
 │   ├── eks.tf               # Kubernetes cluster with OIDC enabled
 │   ├── iam.tf               # IRSA roles + GitLab CI's OIDC-federated role
 │   ├── argocd.tf            # ArgoCD Helm release (cluster bootstrap)
 │   ├── external-secrets.tf  # External Secrets Operator Helm release (cluster bootstrap)
-│   ├── provider.tf          # AWS/Kubernetes/Helm providers, remote S3 state backend
+│   ├── provider.tf          # AWS/Kubernetes/Helm providers, remote S3 state backend (S3-native locking)
 │   ├── rds.tf               # PostgreSQL database for MLflow backend
 │   ├── s3.tf                # Versioned object storage for ML artifacts
 │   ├── variables.tf         # Parametric variables and secrets management
-│   └── vpc.tf               # Network topology (NAT, Private/Public Subnets)
+│   ├── terraform.tfvars     # gitlab_project_path - scopes the OIDC trust policy to this GitLab project
+│   └── vpc.tf               # Network topology (NAT, private/public subnets, EKS node + RDS security groups)
+├── Dockerfile               # FastAPI inference image (non-root UID 1000)
+├── Dockerfile.dashboard     # Streamlit dashboard image (non-root UID 1000)
 ├── Dockerfile.mlflow        # MLflow image with boto3/psycopg2 baked in (S3 artifact store + Postgres backend)
-└── docker-compose.yml       # Local integration testing environment (db, localstack, kafka, mlflow, api, dashboard)
+├── Dockerfile.jobs          # Batch image: core_ml packaged to run inside the cluster (drift-monitor CronJob)
+└── docker-compose.yml       # Local stack (db, localstack, kafka, mlflow, api, dashboard) + the drift-monitor job
 ```
 
 Each deployable unit (`api/`, `core_ml/`) is its own Poetry project with its own lockfile, so the two services can evolve and be deployed independently while still sharing one Makefile-driven quality gate.
