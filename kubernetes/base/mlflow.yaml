@@ -4,7 +4,7 @@ metadata:
   name: mlflow
   namespace: hotel-mlops
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: mlflow
@@ -95,3 +95,21 @@ spec:
     - port: 5000
       targetPort: 5000
   type: LoadBalancer
+---
+# mlflow server itself is stateless - state lives in Postgres and S3 - so two
+# replicas behind the same Service is a supported HA pattern with no
+# leader-election story to build. Without a PDB, a single voluntary
+# disruption (a node drain during an EKS upgrade, a Karpenter consolidation)
+# can evict both replicas in the same window and take the model registry -
+# and therefore api's startup and the drift monitor's baseline lookup - down
+# with it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mlflow-pdb
+  namespace: hotel-mlops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mlflow
