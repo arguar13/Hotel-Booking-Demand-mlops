@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from typing import Any
 
 # MLflow's own HTTP client already retries with backoff (default 5
 # attempts). Left alone, that would compound with the tenacity retry
@@ -14,15 +15,24 @@ import time
 os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
 
 import mlflow.sklearn
+import numpy as np
 import pandas as pd
+import psycopg2
 import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Response, status
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
+from mlflow.tracking import MlflowClient
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from schemas import BookingFeatures
+from monitoring import (
+    FLUSH_INTERVAL_SECONDS,
+    inference_logger,
+    jsonable_features,
+    new_prediction_id,
+)
+from schemas import BookingFeatures, LabelIngest, LabelIngestResponse, PredictionResponse
 
 # Structured JSON logging: every line is a single JSON object (timestamp,
 # level, event, and whatever key=value context each call site attaches),
@@ -51,6 +61,13 @@ app = FastAPI(
 
 # Global model variable
 model = None
+
+# Which registry *version* the alias currently resolves to. Recorded on every
+# logged prediction so a drift finding can be attributed to a specific model
+# version rather than to the moving target the alias is: promoting a new
+# version mid-window would otherwise silently mix two models' predictions into
+# one distribution and make the resulting statistic meaningless.
+model_version: str | None = None
 
 # The MLflow Model Registry is the single, immutable source of truth for the
 # serving model - no local model.joblib fallback. Only a version that passed
@@ -101,6 +118,20 @@ def _load_model_with_retry(model_uri: str):
     return mlflow.sklearn.load_model(model_uri)
 
 
+def _resolve_model_version() -> str | None:
+    """Ask the registry which version the served alias points at right now.
+
+    Best effort by design: the API can serve perfectly well without knowing the
+    version number, so a registry hiccup here degrades the *attribution* of a
+    logged prediction, never the prediction itself.
+    """
+    try:
+        return str(MlflowClient().get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS).version)
+    except Exception as e:  # noqa: BLE001
+        log.warning("model_version_lookup_failed", alias=MODEL_ALIAS, error=str(e))
+        return None
+
+
 @app.on_event("startup")
 def load_model():
     """
@@ -109,7 +140,7 @@ def load_model():
     that alias, `model` stays None and /predict fails explicitly with a 503
     instead of silently serving a stale, untracked local artifact.
     """
-    global model
+    global model, model_version
 
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-service:5000")
     mlflow.set_tracking_uri(tracking_uri)
@@ -118,7 +149,8 @@ def load_model():
     try:
         log.info("model_load_attempt", model_uri=model_uri)
         model = _load_model_with_retry(model_uri)
-        log.info("model_load_succeeded", model_uri=model_uri)
+        model_version = _resolve_model_version()
+        log.info("model_load_succeeded", model_uri=model_uri, model_version=model_version)
     except Exception as e:
         log.error(
             "model_load_failed",
@@ -148,7 +180,7 @@ async def start_model_loader() -> None:
 
 
 async def _model_loader_loop() -> None:
-    global model
+    global model, model_version
 
     model_uri = f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
     while True:
@@ -168,9 +200,11 @@ async def _model_loader_loop() -> None:
             continue
         was_missing = model is None
         model = loaded
+        model_version = await asyncio.to_thread(_resolve_model_version)
         log.info(
             "model_load_succeeded" if was_missing else "model_refreshed",
             model_uri=model_uri,
+            model_version=model_version,
         )
 
 
@@ -202,6 +236,47 @@ def load_kafka_producer():
         )
 
 
+@app.on_event("startup")
+async def start_inference_logger() -> None:
+    """Open the prediction-log sink and start draining its queue.
+
+    Unlike the Kafka producer above, this one runs in production: it needs no
+    broker, only the RDS instance and credentials this pod already has. It is
+    what makes the drift monitor possible, and it is the reason a prediction
+    served in the cluster is now a durable, joinable record instead of a log
+    line on stdout.
+    """
+    await asyncio.to_thread(inference_logger.start)
+    if inference_logger.enabled:
+        asyncio.create_task(_inference_log_flush_loop())
+
+
+async def _inference_log_flush_loop() -> None:
+    """Batch-drain the prediction queue on a fixed interval, forever.
+
+    Runs on the same event loop that serves requests, so the blocking database
+    write is pushed to a worker thread. `flush()` never raises, so this loop
+    cannot die and silently stop persisting predictions - the failure mode that
+    would make a drift report quietly describe a shrinking, unrepresentative
+    sample instead of reporting that it had no data.
+    """
+    while True:
+        await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
+        await asyncio.to_thread(inference_logger.flush)
+
+
+@app.on_event("shutdown")
+async def stop_inference_logger() -> None:
+    """Flush whatever is still queued before the pod goes away.
+
+    Best effort within the termination grace period: at-most-once delivery is
+    the deliberate trade (see monitoring.py), so a batch lost to a hard kill is
+    acceptable - but throwing away a full queue on every routine rollout, when
+    draining it costs one bounded write, would not be.
+    """
+    await asyncio.to_thread(inference_logger.close)
+
+
 @app.get("/health")
 def health():
     """
@@ -216,7 +291,14 @@ def health():
         "status": "ok",
         "model_loaded": model is not None,
         "model_alias": MODEL_ALIAS,
+        "model_version": model_version,
         "kafka_circuit_breaker_state": _kafka_breaker.current_state,
+        # Surfaced here for the same reason as the Kafka breaker: the prediction
+        # sink failing is a partial degradation that must not fail readiness,
+        # but it silently starves the drift monitor of data. `rows_dropped`
+        # climbing is the signal that a drift report is about to be computed on
+        # a sample that no longer represents production traffic.
+        "inference_logging": inference_logger.stats(),
     }
 
 
@@ -236,38 +318,184 @@ def ready(response: Response):
     return {"status": "ready", "model_alias": MODEL_ALIAS}
 
 
-@app.post("/predict")
+def _predict_with_confidence(
+    estimator: Any, input_data: pd.DataFrame
+) -> tuple[str, float | None, float | None]:
+    """Predict one row, returning the label plus its two uncertainty signals.
+
+    `confidence` is the winning class probability; `margin` is the gap to the
+    runner-up. Both are the standard unsupervised early-warning signals for
+    concept drift: ground truth arrives with a reconciliation delay, so for as
+    long as a window is unlabelled these are the only evidence available that
+    the decision boundary no longer fits the traffic. Confidence alone is not
+    enough - a model can stay confident while flipping between two classes it
+    can no longer separate, and only the margin shows that.
+
+    One forward pass, not two: for every scikit-learn classifier `predict` is
+    defined as `classes_[argmax(predict_proba)]`, so taking the argmax here is
+    identical to calling `predict` and half the work. Estimators without
+    `predict_proba` (or without `classes_`) fall back to a plain label rather
+    than failing - degrading the monitoring signal, never the endpoint.
+    """
+    predict_proba = getattr(estimator, "predict_proba", None)
+    classes = getattr(estimator, "classes_", None)
+    if predict_proba is None or classes is None:
+        return str(estimator.predict(input_data)[0]), None, None
+
+    probabilities = predict_proba(input_data)[0]
+    ranked = np.argsort(probabilities)[::-1]
+    confidence = float(probabilities[ranked[0]])
+    runner_up = float(probabilities[ranked[1]]) if len(ranked) > 1 else 0.0
+    return str(classes[ranked[0]]), confidence, confidence - runner_up
+
+
+@app.post("/predict", response_model=PredictionResponse)
 def predict_segment(features: BookingFeatures):
     """
     Predicts the market segment based on booking features.
+
+    The response carries a `prediction_id`: quote it back on POST /feedback once
+    the booking's true segment is known, and this prediction becomes part of the
+    labelled sample the drift monitor measures concept drift on.
     """
-    if model is None:
+    estimator = model
+    if estimator is None:
         raise HTTPException(status_code=503, detail="Model is currently unavailable.")
 
+    feature_map = features.model_dump()
     try:
-        input_data = pd.DataFrame([features.model_dump()])
-        prediction = model.predict(input_data)
-        predicted_segment = str(prediction[0])
+        input_data = pd.DataFrame([feature_map])
+        predicted_segment, confidence, margin = _predict_with_confidence(estimator, input_data)
     except Exception as e:
         log.error("prediction_failed", error=str(e))
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    log.info("prediction_succeeded", predicted_market_segment=predicted_segment)
-    _publish_prediction_event(features, predicted_segment)
-    return {"predicted_market_segment": predicted_segment}
+    prediction_id = new_prediction_id()
+
+    log.info(
+        "prediction_succeeded",
+        prediction_id=prediction_id,
+        predicted_market_segment=predicted_segment,
+        confidence=confidence,
+        model_version=model_version,
+    )
+
+    # Both sinks are non-blocking and non-fatal by construction: the durable
+    # one (Postgres) is an enqueue, the optional one (Kafka) is breaker-guarded.
+    inference_logger.record_prediction(
+        prediction_id=prediction_id,
+        model_name=MODEL_NAME,
+        model_alias=MODEL_ALIAS,
+        model_version=model_version,
+        predicted_segment=predicted_segment,
+        confidence=confidence,
+        margin=margin,
+        features=jsonable_features(feature_map),
+    )
+    _publish_prediction_event(
+        features,
+        predicted_segment,
+        prediction_id=prediction_id,
+        confidence=confidence,
+    )
+
+    return PredictionResponse(
+        predicted_market_segment=predicted_segment,
+        prediction_id=prediction_id,
+        model_version=model_version,
+        confidence=confidence,
+        margin=margin,
+    )
 
 
-def _publish_prediction_event(features: BookingFeatures, predicted_segment: str) -> None:
-    """Best-effort publish; Kafka being down must never fail the HTTP response."""
+@app.post("/feedback", response_model=LabelIngestResponse, status_code=status.HTTP_202_ACCEPTED)
+async def ingest_labels(labels: list[LabelIngest]):
+    """Record the ground-truth segment for previously served predictions.
+
+    This is the delayed-label half of the loop, and the only reason this system
+    can measure *concept* drift (a change in P(y|X)) rather than merely data
+    drift (a change in P(X)). In this domain the truth is knowable: a booking's
+    market segment is settled when the reservation is reconciled against its
+    channel of record, hours to days after the prediction was served. That is
+    what a nightly reconciliation job posts here, in batches.
+
+    Deliberately not a fire-and-forget enqueue like /predict: labels are
+    low-volume, arrive from a batch job that can retry, and are worthless if
+    silently dropped - a monitor computing accuracy over a sample that quietly
+    lost a biased subset of its labels reports a number that is worse than no
+    number. So the write is synchronous and a failure is a 503 the caller can
+    act on. The upsert is idempotent, so retrying a whole batch is safe.
+    """
+    if not labels:
+        return LabelIngestResponse(accepted=0, skipped=0)
+
+    if not inference_logger.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Inference logging is disabled; there is no prediction log to label.",
+        )
+
+    # Drain this replica's pending predictions first. Predictions are persisted
+    # asynchronously, so a caller that reconciles quickly can hold an id that has
+    # not reached the table yet; flushing here closes that window for everything
+    # this pod served. It cannot close it for a sibling replica, which is why
+    # `skipped` exists and why the caller is expected to re-post.
+    await asyncio.to_thread(inference_logger.flush)
+
+    try:
+        accepted = await asyncio.to_thread(
+            inference_logger.record_labels,
+            [
+                (item.prediction_id, item.actual_market_segment, item.label_source)
+                for item in labels
+            ],
+        )
+    except pybreaker.CircuitBreakerError as e:
+        log.warning("label_ingest_skipped", reason="circuit breaker open", count=len(labels))
+        raise HTTPException(
+            status_code=503, detail="Monitoring store unavailable; retry this batch."
+        ) from e
+    except (psycopg2.Error, OSError, RuntimeError) as e:
+        log.error("label_ingest_failed", error=str(e), count=len(labels))
+        raise HTTPException(status_code=503, detail="Could not record labels.") from e
+
+    skipped = len(labels) - accepted
+    if skipped:
+        # Either the prediction is still queued somewhere, or the id was never
+        # served at all. Both are the caller's cue to re-post the batch, which is
+        # safe: the write is an idempotent upsert.
+        log.info("label_ingest_partial", accepted=accepted, skipped=skipped)
+    else:
+        log.info("label_ingest_succeeded", accepted=accepted)
+    return LabelIngestResponse(accepted=accepted, skipped=skipped)
+
+
+def _publish_prediction_event(
+    features: BookingFeatures,
+    predicted_segment: str,
+    prediction_id: str | None = None,
+    confidence: float | None = None,
+) -> None:
+    """Best-effort publish; Kafka being down must never fail the HTTP response.
+
+    Retained as an *optional* side channel for consumers that want predictions
+    as a stream (it is wired up in docker-compose, not in the cluster). The
+    durable record the drift monitor actually reads is the Postgres write above -
+    see monitoring.py for why a broker is not the right dependency for this
+    volume.
+    """
     if _kafka_producer is None:
         return
 
     event = {
         "timestamp": time.time(),
+        "prediction_id": prediction_id,
         "model_name": MODEL_NAME,
         "model_alias": MODEL_ALIAS,
+        "model_version": model_version,
         "features": features.model_dump(),
         "predicted_market_segment": predicted_segment,
+        "confidence": confidence,
     }
     try:
         _kafka_breaker.call(_kafka_producer.send, KAFKA_PREDICTIONS_TOPIC, event)

@@ -5,6 +5,12 @@ locals {
     # Ships boto3/psycopg2 baked in (Dockerfile.mlflow) - the same image
     # docker-compose.yml uses locally, promoted unchanged to production.
     mlflow = "${var.project_name}-mlflow"
+    # Batch workloads: core_ml's code packaged to run inside the cluster
+    # (Dockerfile.jobs). The drift-monitor CronJob runs from it today; a
+    # scheduled retrain would reuse the same image with a different command.
+    # Until this image existed, none of the three carried the ML code at all,
+    # so nothing on the training/monitoring side could run outside a laptop.
+    jobs = "${var.project_name}-jobs"
   }
 }
 
@@ -46,5 +52,5 @@ resource "aws_ecr_lifecycle_policy" "this" {
 
 output "ecr_repository_urls" {
   value       = { for k, v in aws_ecr_repository.this : k => v.repository_url }
-  description = "URLs de los repositorios ECR (api, dashboard, mlflow)"
+  description = "URLs de los repositorios ECR (api, dashboard, mlflow, jobs)"
 }

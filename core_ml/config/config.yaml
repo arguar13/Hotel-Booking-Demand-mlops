@@ -8,6 +8,17 @@ data:
   toy_processed_data_path: "data/toy/processed_hotel_bookings_toy.csv"
   toy_sample_size: 1000
   valid_classes_min_count: 10
+  # Optional upper bound on the arrival year used for training - a training
+  # period, which every production model has whether or not it is written
+  # down. Left empty the whole dataset is used.
+  #
+  # It is also what makes an honest drift backtest possible: this dataset
+  # spans 2015-07 to 2017-08 and its booking mix genuinely shifts towards
+  # online travel agencies over that period, so training with
+  # train_max_year: 2016 and then replaying 2017 through the API
+  # (scripts/replay_bookings.py) measures the monitor against drift that
+  # actually happened, rather than against injected noise.
+  train_max_year: null
 
 model:
   target_column: "market_segment"
@@ -31,3 +42,56 @@ mlflow:
 api:
   host: "0.0.0.0"
   port: 8000
+
+# Drift monitoring. Read by the CronJob in kubernetes/base/drift-monitor-cronjob.yaml
+# (src/monitoring/drift_monitor.py), never by the API. Every threshold here is a
+# deliberate operating point, not a default someone forgot to tune - a monitor
+# that fires on noise gets silenced within a fortnight, and a silenced monitor
+# is worse than none because it is still believed.
+monitoring:
+  experiment_name: "hotel_market_segmentation_monitoring"
+
+  # The half-open window each run evaluates. Daily is the right cadence for a
+  # reconciliation delay measured in hours-to-days: shorter windows carry too
+  # few labels to say anything, longer ones average a change away.
+  window_hours: 24
+
+  # Sample-size guards. Below these, the run reports SKIPPED rather than "no
+  # drift" - the distinction matters, because "we could not tell" and "we
+  # checked and it is fine" call for very different responses.
+  min_predictions: 500
+  min_labelled: 300
+  # Hard cap on rows pulled into memory; the CronJob has a memory limit and a
+  # monitor that gets OOM-killed goes quiet exactly when traffic spikes.
+  max_rows: 200000
+
+  # Data drift escalates on the *share* of features that moved, not on any
+  # single one: one drifted feature out of thirty is ordinary seasonality,
+  # a third of them moving together is a pipeline change or a new population.
+  # Per-feature PSI still uses the standard 0.10 / 0.25 bands (statistics.py).
+  drift_share_warn: 0.20
+  drift_share_alert: 0.35
+
+  # Confidence drift is a proxy, so it can only ever raise WARN. A 10% relative
+  # fall in mean top-class probability is large enough not to trip on a
+  # genuinely harder week.
+  confidence_relative_tolerance: 0.10
+
+  # Concept drift - the one that matters. Weighted F1 on the labelled window,
+  # against the baseline logged with the served model version. The alert
+  # tolerance is set where the drop is worth acting on, not where it becomes
+  # detectable; the bootstrap interval then has to agree before it escalates.
+  f1_warn_tolerance: 0.03
+  f1_alert_tolerance: 0.05
+  bootstrap_resamples: 1000
+
+  # Hysteresis: a single alerting window is recorded but does not escalate.
+  # Two consecutive windows on the same model version must agree first, which
+  # is what separates a real regression from one unlucky Tuesday.
+  consecutive_alerts_required: 2
+
+  # A confirmed ALERT exits non-zero, so the Job shows as Failed and whatever
+  # already watches Kubernetes job failures sees it - the same "fail loudly"
+  # posture as the training quality gate, rather than a new alerting channel
+  # this project would have to own.
+  fail_on_alert: true

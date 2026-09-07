@@ -1,0 +1,107 @@
+# The drift monitor, on a schedule.
+#
+# A CronJob rather than a workflow engine: this is one container, run once a
+# day, with no fan-out and no inter-task dependencies. Airflow, Argo Workflows
+# or Step Functions would each add a control plane to operate, upgrade and
+# secure in exchange for scheduling semantics Kubernetes already has natively -
+# the same reasoning that kept Kustomize instead of Helm for this repo's own
+# manifests. When there is a second task with a real dependency on the first,
+# that trade changes; today it does not.
+#
+# It is also the first workload here that is *not* a long-running service, which
+# is why it is the workload that required Dockerfile.jobs to exist at all.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: drift-monitor
+spec:
+  # 04:00 UTC daily: after the overnight reconciliation window that supplies
+  # ground-truth labels for the previous day's predictions, and before the
+  # working day it would otherwise compete with for RDS connections.
+  schedule: "0 4 * * *"
+  timeZone: "Etc/UTC"
+
+  # Forbid, not Allow: two monitors reading overlapping windows would log two
+  # contradictory verdicts for the same period into MLflow, and the hysteresis
+  # counter (which reads back its own run history) would count one slow run
+  # twice and escalate on a single window.
+  concurrencyPolicy: Forbid
+
+  # If the controller was down when the schedule fired, only start a missed run
+  # if it is still fresh. A stale window evaluated hours late produces a verdict
+  # about a period nobody can act on any more.
+  startingDeadlineSeconds: 3600
+
+  successfulJobsHistoryLimit: 3
+  # Kept deeper than the successful ones on purpose: a failed run is evidence,
+  # and `kubectl logs` on a pod that has already been garbage-collected is the
+  # most common reason an alert cannot be investigated the next morning.
+  failedJobsHistoryLimit: 5
+
+  jobTemplate:
+    spec:
+      # No retries. A failure here is either a genuine ALERT (exit 1 by design -
+      # see config.yaml's fail_on_alert) or a real defect; retrying the first
+      # would log the same alert three times and reset nothing, and retrying the
+      # second just hides it.
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      # Keep finished pods around for a day so their logs survive the run.
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: jobs-sa
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: drift-monitor
+              # Tag set per-overlay via `kustomize edit set image`, exactly like
+              # the three service images - CI writes the freshly-built
+              # $IMAGE_TAG here and commits (see .gitlab-ci.yml's
+              # gitops-release job).
+              image: hotel-mlops-jobs:local
+              imagePullPolicy: Always
+              command: ["python", "-m", "src.monitoring.drift_monitor"]
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              envFrom:
+                # The exact same ConfigMap and Secret the api Deployment
+                # consumes, so "where the monitoring store is" and "where MLflow
+                # is" have one definition in Git rather than one per workload.
+                - secretRef:
+                    name: mlops-secrets
+                - configMapRef:
+                    name: mlops-config
+              # Bounded on purpose. The job pulls a capped window into a
+              # DataFrame and runs a 1000-resample bootstrap; the limit is what
+              # turns "the window was unexpectedly enormous" into a failed job
+              # with a clear reason instead of an evicted node.
+              resources:
+                requests:
+                  cpu: "200m"
+                  memory: "512Mi"
+                limits:
+                  cpu: "1"
+                  memory: "2Gi"
+              # Read-only root filesystem: MLflow stages the reference profile
+              # it downloads and the report it uploads through a temp dir, and
+              # keeps its client cache under $HOME.
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                - name: home
+                  mountPath: /home/appuser
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            - name: home
+              emptyDir: {}

@@ -129,10 +129,26 @@ services:
       - AWS_SECRET_ACCESS_KEY=test
       - AWS_DEFAULT_REGION=us-east-1
       - MLFLOW_S3_ENDPOINT_URL=http://localstack:4566
+      # Inference logging (api/monitoring.py). Same env contract the production
+      # ConfigMap/Secret provide, pointed at the local Postgres, so the
+      # prediction log and the ground-truth labels behave here exactly as they
+      # do in the cluster - including the schema being created on first start.
+      - MODEL_REFRESH_SECONDS=300
+      - MONITORING_ENABLED=true
+      - DB_HOST=db
+      - DB_PORT=5432
+      - POSTGRES_USER=mlops_user
+      - POSTGRES_PASSWORD=mlops_password
+      - POSTGRES_DB=mlflow_db
     depends_on:
-      - mlflow
-      - kafka
-      - localstack
+      db:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+      kafka:
+        condition: service_started
+      localstack:
+        condition: service_healthy
 
   dashboard:
     build:
@@ -144,6 +160,33 @@ services:
       - API_URL=http://api:8000
     depends_on:
       - api
+
+  # The drift monitor, as a one-shot container - the same image and the same
+  # entrypoint the production CronJob runs (Dockerfile.jobs), so the loop can be
+  # exercised end to end on a laptop before it is ever scheduled in EKS. Behind
+  # a profile because it is a job, not a service: `make up` must not start it.
+  # Run it with `make drift-report` after `make replay` has produced traffic.
+  drift-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.jobs
+    profiles: ["jobs"]
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - DB_HOST=db
+      - DB_PORT=5432
+      - POSTGRES_USER=mlops_user
+      - POSTGRES_PASSWORD=mlops_password
+      - POSTGRES_DB=mlflow_db
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+      - MLFLOW_S3_ENDPOINT_URL=http://localstack:4566
+    depends_on:
+      db:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
 
   # Real GitLab Runner, registered against this project, so CI jobs can be
   # validated on this machine before they're ever pushed (`gitlab-runner

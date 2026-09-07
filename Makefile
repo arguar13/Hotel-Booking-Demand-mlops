@@ -14,7 +14,7 @@ ALL_PROJECTS := api core_ml integration-tests
 .PHONY: help install lock format lint typecheck test test-api test-core-ml \
         test-integration security yaml-lint precommit precommit-install ci \
         clean up down data-toy dvc-repro dvc-pull dvc-push train train-toy \
-        ci-dry-run ci-dry-run-train \
+        ci-dry-run ci-dry-run-train replay replay-drift drift-report \
         runner-register runner-start runner-stop k8s-build tf-fmt \
         tf-validate tf-plan
 
@@ -113,6 +113,21 @@ train: dvc-repro ## Train on the full dataset (needs a reachable MLflow server, 
 train-toy: ## Fast (~seconds) end-to-end training run against the toy dataset
 	poetry -C core_ml run dvc repro clean_data_toy
 	HOTEL_MLOPS_USE_TOY_DATA=true poetry -C core_ml run python -m src.train
+
+# --- Monitoring / drift ---
+# The loop, runnable end to end on a laptop: `make up`, train a model, replay a
+# slice of real bookings through the API (which logs every prediction and its
+# reconciled label to Postgres), then run the same drift job the production
+# CronJob runs, from the same image.
+
+replay: ## Replay real 2016 bookings through /predict + /feedback (baseline period)
+	poetry -C core_ml run python scripts/replay_bookings.py --year 2016 --limit 3000
+
+replay-drift: ## Replay real 2017 bookings - the period where the channel mix actually shifted
+	poetry -C core_ml run python scripts/replay_bookings.py --year 2017 --months 5 6 7 --limit 3000
+
+drift-report: ## Run the drift monitor against the local stack, from the real jobs image
+	docker compose --profile jobs run --rm --build drift-monitor
 
 clean: ## Remove caches and build artifacts
 	@find . -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.ruff_cache' -o -name '.mypy_cache' \) -not -path '*/.git/*' -exec rm -rf {} + 2>/dev/null || true

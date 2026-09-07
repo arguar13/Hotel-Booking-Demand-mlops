@@ -72,6 +72,40 @@ output "api_iam_role_arn" {
   value = module.api_irsa_role.iam_role_arn
 }
 
+# IRSA for in-cluster batch workloads (the drift-monitor CronJob today). It
+# needs the same artifacts bucket the API and MLflow use - read, to pull the
+# reference profile logged with the served model version; write, because the
+# drift report it produces is itself an MLflow artifact - but it is a distinct
+# workload with a distinct lifecycle, so it gets a distinct role rather than
+# borrowing api-sa's. Reusing the serving identity would mean every permission
+# a future batch job needs is silently granted to the internet-facing API too.
+module "jobs_irsa_role" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "~> 5.30"
+
+  role_name = "${var.project_name}-jobs-irsa"
+
+  role_policy_arns = {
+    artifacts_bucket_rw = aws_iam_policy.artifacts_bucket_rw.arn
+  }
+
+  oidc_providers = {
+    main = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["default:jobs-sa"]
+    }
+  }
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
+output "jobs_iam_role_arn" {
+  value       = module.jobs_irsa_role.iam_role_arn
+  description = "ARN to annotate on the jobs-sa ServiceAccount (drift-monitor CronJob)"
+}
+
 # ============================================================
 # IRSA para External Secrets Operator: lee AWS Secrets Manager y
 # materializa Secrets de Kubernetes a partir de un ExternalSecret

@@ -51,11 +51,14 @@ terraform/bootstrap/.terraform/
 terraform/bootstrap/terraform.tfstate*
 *.tfstate
 *.tfstate.*
-# Saved plan files, under any name (`-out=tfplan.bin` included): a plan
-# holds fully-resolved values, so it can contain secrets pulled from data
-# sources (the RDS password) and generated credentials. Never commit one.
+# Saved plan files, under any name (`-out=tfplan.bin` / `-out=tfdestroy.bin`
+# included): a plan holds fully-resolved values, so it can contain secrets
+# pulled from data sources (the RDS password) and generated credentials.
+# A destroy plan is no different - it is still a rendered snapshot of state.
+# Never commit one.
 *.tfplan
 tfplan*
+tfdestroy*
 crash.log
 crash.*.log
 

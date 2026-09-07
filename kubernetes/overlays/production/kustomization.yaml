@@ -34,3 +34,6 @@ images:
 - name: hotel-mlops-mlflow
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-mlflow
   newTag: f55f653acfa7dd6a47619d8c29e84c2845f849cc
+- name: hotel-mlops-jobs
+  newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-jobs
+  newTag: f55f653acfa7dd6a47619d8c29e84c2845f849cc
