@@ -387,6 +387,8 @@ Con el stack del paso 5 corriendo y un modelo entrenado y aliasado, el bucle com
 | `make replay` | Reproduce 3.000 reservas reales de 2016 contra `/predict`, y luego concilia el 80% vía `/feedback` |
 | `make replay-drift` | Reproduce reservas reales de 2017 — el periodo donde la mezcla de reservas se desplazó de verdad |
 | `make drift-report` | Ejecuta el monitor de drift (`Dockerfile.jobs`) sobre la ventana y registra el veredicto como run de MLflow |
+| `make stream-up` | Levanta [`stream_consumer.py`](core_ml/src/monitoring/stream_consumer.py) contra el propio Kafka de este stack — el mismo camino de código que producción, sin necesitar MSK para ejercitarlo |
+| `make stream-logs` | Sigue los logs del consumidor de streaming (veredictos de drift, intentos de mitigación) |
 
 El informe aparece en la UI de MLflow bajo el experimento `hotel_market_segmentation_monitoring`: métricas (`concept_live_f1`, `concept_baseline_f1`, `drift_share`, un `psi_<feature>` por característica) más `drift/drift_report.html` y `drift/drift_report.json` como artefactos.
 

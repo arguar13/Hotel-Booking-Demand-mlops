@@ -388,6 +388,8 @@ With the stack from step 5 running and a model trained and aliased, the whole lo
 | `make replay` | Replays 3,000 real 2016 bookings through `/predict`, then reconciles 80% of them through `/feedback` |
 | `make replay-drift` | Replays real 2017 bookings — the period where the booking mix actually shifted |
 | `make drift-report` | Runs the drift monitor (`Dockerfile.jobs`) against the window and records the verdict as an MLflow run |
+| `make stream-up` | Starts [`stream_consumer.py`](core_ml/src/monitoring/stream_consumer.py) against this stack's own Kafka broker — the same code path as production, no MSK needed to exercise it |
+| `make stream-logs` | Follows the streaming consumer's logs (drift verdicts, mitigation attempts) |
 
 The report lands in the MLflow UI under the `hotel_market_segmentation_monitoring` experiment: metrics (`concept_live_f1`, `concept_baseline_f1`, `drift_share`, one `psi_<feature>` per feature) plus `drift/drift_report.html` and `drift/drift_report.json` as artifacts.
 
