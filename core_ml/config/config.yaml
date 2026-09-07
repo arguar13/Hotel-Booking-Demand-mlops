@@ -22,7 +22,13 @@ data:
 
 model:
   target_column: "market_segment"
+  # Three-way split, not two-way: Optuna tunes against validation_size only.
+  # test_size is set aside before tuning starts and is touched exactly once,
+  # for the final quality-gate score and the monitoring baseline - so that
+  # figure is an honest estimate of production performance rather than a
+  # hyperparameter-selection score wearing a "held-out" label.
   test_size: 0.2
+  validation_size: 0.2
   random_state: 42
   n_trials_optuna: 2
   # Quality gate: a trained model version is only aliased below when its

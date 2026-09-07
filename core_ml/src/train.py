@@ -138,12 +138,31 @@ def train_pipeline() -> str:
     X = df.drop(columns=[config["model"]["target_column"]])
     y = df[config["model"]["target_column"]]
 
-    X_train, X_test, y_train, y_test = train_test_split(
+    # Three-way split. Optuna's objective below is scored on X_val only - never
+    # on X_test - because a hyperparameter search that gets to see the test set
+    # is a search that overfits to it: fifty-odd trials each nudging toward
+    # whatever happens to work on that particular sample stops being a
+    # held-out estimate and starts being the metric that was searched for. The
+    # final pipeline is refit on train+val once tuning is settled (no reason
+    # to discard labelled data once it is no longer influencing which
+    # hyperparameters get picked) and X_test is then touched exactly once, for
+    # the number that actually goes into the quality gate and the monitoring
+    # baseline.
+    test_size = config["model"]["test_size"]
+    validation_size = config["model"]["validation_size"]
+    X_train, X_holdout, y_train, y_holdout = train_test_split(
         X,
         y,
-        test_size=config["model"]["test_size"],
+        test_size=test_size + validation_size,
         random_state=config["model"]["random_state"],
         stratify=y,
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_holdout,
+        y_holdout,
+        test_size=test_size / (test_size + validation_size),
+        random_state=config["model"]["random_state"],
+        stratify=y_holdout,
     )
 
     # Preprocessing definitions
@@ -189,9 +208,9 @@ def train_pipeline() -> str:
         )
 
         pipeline.fit(X_train, y_train)
-        preds = pipeline.predict(X_test)
+        preds = pipeline.predict(X_val)
 
-        return f1_score(y_test, preds, average="weighted")
+        return f1_score(y_val, preds, average="weighted")
 
     log.info("optuna_tuning_started", n_trials=config["model"]["n_trials_optuna"])
     study = optuna.create_study(direction="maximize")
@@ -220,7 +239,12 @@ def train_pipeline() -> str:
             ]
         )
 
-        final_pipeline.fit(X_train, y_train)
+        # Refit on train+val: validation's job (selecting best_params) is done,
+        # so folding it back into the fit gives the shipped model more signal
+        # without touching X_test, which still has never been seen by anything.
+        X_fit = pd.concat([X_train, X_val])
+        y_fit = pd.concat([y_train, y_val])
+        final_pipeline.fit(X_fit, y_fit)
         y_pred = final_pipeline.predict(X_test)
 
         # Metrics
@@ -239,12 +263,13 @@ def train_pipeline() -> str:
         # drift CronJob reads it back through the registry alias and never needs
         # the training dataset, DVC, or bucket credentials to do its job.
         #
-        # Built from X_train/y_train, not the full frame: the reference for
-        # "what did this model learn from" is exactly the rows it was fitted on.
+        # Built from X_fit/y_fit (train+val), not the full frame: the reference
+        # for "what did this model learn from" is exactly the rows it was
+        # fitted on, which is train+val now that val has been folded back in.
         mean_confidence, mean_margin = _confidence_signals(final_pipeline, X_test)
         reference_profile = build_reference_profile(
-            features=X_train,
-            target=y_train,
+            features=X_fit,
+            target=y_fit,
             target_column=config["model"]["target_column"],
             performance=PerformanceBaseline(
                 f1_weighted=float(f1),
