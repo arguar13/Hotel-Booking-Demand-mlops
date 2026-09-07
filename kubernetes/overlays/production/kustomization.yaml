@@ -18,6 +18,7 @@ configMapGenerator:
   envs:
   - mlops-config.env
   name: mlops-config
+  namespace: hotel-mlops
 
 # Updated on every successful build by .gitlab-ci.yml's gitops-release job
 # via `kustomize edit set image <name>=<registry>/<repo>:<tag>` - a

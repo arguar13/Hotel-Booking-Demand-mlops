@@ -36,7 +36,7 @@ module "mlflow_irsa_role" {
   oidc_providers = {
     main = {
       provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["default:mlflow-sa"]
+      namespace_service_accounts = ["hotel-mlops:mlflow-sa"]
     }
   }
 
@@ -63,7 +63,7 @@ module "api_irsa_role" {
   oidc_providers = {
     main = {
       provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["default:api-sa"]
+      namespace_service_accounts = ["hotel-mlops:api-sa"]
     }
   }
 }
@@ -92,7 +92,7 @@ module "jobs_irsa_role" {
   oidc_providers = {
     main = {
       provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["default:jobs-sa"]
+      namespace_service_accounts = ["hotel-mlops:jobs-sa"]
     }
   }
 
