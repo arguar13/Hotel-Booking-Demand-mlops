@@ -97,3 +97,80 @@ monitoring:
   # posture as the training quality gate, rather than a new alerting channel
   # this project would have to own.
   fail_on_alert: true
+
+  # Near-real-time early warning (core_ml/src/monitoring/stream_consumer.py),
+  # not a second monitor: the consumer overlays these fields onto the block
+  # above and calls the exact same run_monitor() the CronJob does, only over
+  # a much shorter, Kafka-triggered window. Everything not listed here
+  # (drift_share_*, confidence_relative_tolerance, f1_*, bootstrap_resamples,
+  # min_labelled, max_rows) is inherited unchanged.
+  stream:
+    # Separate MLflow experiment so this monitor's hysteresis counter
+    # (count_consecutive_alerts) never mixes with the daily CronJob's - a
+    # burst of short, noisy windows must not silently satisfy (or reset) the
+    # streak the batch monitor is counting, and vice versa.
+    experiment_name: "hotel_market_segmentation_monitoring_stream"
+    window_hours: 0.25 # 15 minutes
+    # Far below the batch job's 500: a 15-minute window at this project's
+    # traffic simply will not see 500 predictions, and requiring it would
+    # make this monitor permanently SKIPPED, which is worse than never
+    # having built it.
+    min_predictions: 50
+    # Noisier, smaller windows need more agreement before they are allowed to
+    # trigger mitigation.py's auto-retrain - 3 consecutive short windows
+    # roughly matches the statistical weight of the batch monitor's 2 daily
+    # ones, at a fraction of the sample size each.
+    consecutive_alerts_required: 3
+    # min_labelled is intentionally NOT overridden here: at 15-minute
+    # windows, reconciled ground truth almost never exists yet, so
+    # concept_drift correctly reports SKIPPED (see drift_monitor.py's
+    # compute_concept_drift) rather than a manufactured verdict. This
+    # consumer's real contribution is data/prediction/confidence drift,
+    # hours before the batch job would see the same window at all.
+    kafka_topic: "predictions"
+    kafka_consumer_group: "hotel-mlops-stream-monitor"
+    # Micro-batch trigger, not per-message evaluation: recomputing drift
+    # statistics on every single prediction event would be both wasteful and
+    # noisier than the sample size supports. Whichever of these fires first
+    # triggers one run_monitor() pass.
+    trigger_batch_size: 25
+    trigger_max_interval_seconds: 300
+
+# Automatic mitigation (core_ml/src/monitoring/mitigation.py). Consumed by
+# both the batch CronJob and stream_consumer.py, deliberately never by
+# train.py itself - training stays retrain-on-command either way, this only
+# decides *when* an ALERT verdict is allowed to issue that command
+# automatically, and gates *promotion* behind a canary comparison rather
+# than trusting a fresh training run on its own (see
+# core_ml/src/promote_model.py).
+mitigation:
+  enabled: true
+
+  # Bounded auto-retrain, mechanism 1: no new automatic pipeline trigger
+  # within this many hours of the last one, regardless of which monitor
+  # (batch or stream) is asking. Without this, a batch ALERT and a stream
+  # ALERT minutes apart - both correctly hysteresis-gated on their own
+  # terms - would still fire two full retrains for the same underlying
+  # incident.
+  cooldown_hours: 6
+
+  # Bounded auto-retrain, mechanism 2: a hard ceiling on how many automatic
+  # retrains this system will launch itself in a rolling window. A drift
+  # source that a retrain cannot fix (an upstream data-quality break, not a
+  # genuine distribution shift) would otherwise retrigger every
+  # cooldown_hours forever. Hitting the ceiling fails loudly instead -
+  # logged at ERROR and left for a human, the same "evidence, not a
+  # decision" posture drift_monitor.py already has for detection.
+  max_auto_retrains: 3
+  max_auto_retrains_window_days: 7
+
+  # GitLab Pipeline Trigger API (terraform/secrets.tf provisions the
+  # token). A bounded HTTP call, not a queued/retried job: a trigger that
+  # cannot reach GitLab within this timeout fails the mitigation attempt
+  # and is logged, rather than blocking the monitor process or retrying
+  # without limit.
+  gitlab_api_url_env: "GITLAB_API_URL"
+  gitlab_project_path_env: "GITLAB_PROJECT_PATH"
+  gitlab_ref_env: "GITLAB_REF"
+  gitlab_token_env: "GITLAB_TRIGGER_TOKEN"
+  trigger_timeout_seconds: 10

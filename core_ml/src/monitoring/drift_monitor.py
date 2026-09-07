@@ -26,11 +26,20 @@ a specific way monitors become noise and get ignored:
   * hysteresis - a single ALERT window is reported but does not escalate;
     `consecutive_alerts_required` windows in a row must agree first.
 
-**It never retrains or promotes anything.** The job's authority ends at
-recording a finding and failing loudly. Closing the loop automatically -
-drift fires, model retrains, alias moves - would let a data-quality incident
-upstream promote a model trained on the incident, with no human between the
-two. Retraining is a decision; this is the evidence for it.
+**It records a finding and, only on a confirmed ALERT, may ask
+mitigation.py to launch a retrain - it still never promotes anything.**
+Earlier revisions of this module made no exception at all here, on the
+reasoning that closing the loop automatically - drift fires, model
+retrains, alias moves - would let a data-quality incident upstream promote
+a model trained on the incident, with no human between the two. That
+reasoning still holds for *promotion*, which is exactly why this module
+still does not do it and never will: alias moves happen only in
+core_ml/src/promote_model.py, gated on a canary comparison against the
+model already serving. What changed is narrower than it looks - this
+module may now cause a training run to *exist*; it still cannot make one
+*serve traffic*. See mitigation.py's own module docstring for the cooldown,
+ceiling and failure handling that keep "may trigger a retrain" from
+becoming an uncontrolled loop.
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ from mlflow.tracking import MlflowClient
 from sklearn.metrics import accuracy_score, f1_score
 
 from src.config_loader import load_config
+from src.monitoring import mitigation
 from src.monitoring.profile import ReferenceProfile, histogram
 from src.monitoring.report import render_html_report
 from src.monitoring.statistics import (
@@ -639,6 +649,27 @@ def run_monitor(config: dict | None = None) -> DriftReport:
     )
 
     _record_run(report, experiment.experiment_id, monitoring_config)
+
+    # Only a confirmed ALERT (hysteresis already applied above) may ask for a
+    # retrain, and only mitigation.py's own cooldown/ceiling decide whether
+    # that request actually launches one. See this module's docstring and
+    # mitigation.py's for why this is not the same thing the original
+    # "never retrains" design argued against.
+    if report.status == "ALERT":
+        outcome = mitigation.trigger_retrain(
+            source="batch",
+            reason=report.reason,
+            model_version=report.model_version,
+            config=config,
+        )
+        log.info(
+            "mitigation_requested",
+            source="batch",
+            triggered=outcome.triggered,
+            reason=outcome.reason,
+            pipeline_id=outcome.pipeline_id,
+        )
+
     return report
 
 
