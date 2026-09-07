@@ -71,6 +71,7 @@ def base_config(tmp_path: Path) -> dict:
         "model": {
             "target_column": "market_segment",
             "test_size": 0.3,
+            "validation_size": 0.2,
             "random_state": 42,
             "n_trials_optuna": 1,
             "min_f1_threshold": 0.5,
