@@ -39,14 +39,20 @@ Design constraints, in priority order:
    would put the serving path back into the dependency chain, which
    constraint 1 forbids.
 
-Why Postgres rather than the Kafka topic main.py already publishes to: that
-topic exists only in docker-compose - there is no broker in the production
-cluster, and standing one up to move a few thousand rows a day would
-contradict this project's own stated trade-off against streaming
-infrastructure the volume does not justify. RDS is already provisioned,
-already reachable, already credentialed for this pod through `mlops-secrets`,
-and - unlike an object-store append log - answers the windowed, joined query
-the monitor actually needs.
+Why Postgres rather than the Kafka topic main.py also publishes to
+(terraform/msk.tf provisions the broker; core_ml/src/monitoring/stream_consumer.py
+is the other reader): this module's job is the durable, joinable record that
+concept drift's ground-truth reconciliation and every CronJob run depend on.
+At-most-once delivery to an unbounded queue (constraint 3 above) is the right
+trade for that job precisely because it is never the only copy - the row is
+also in Postgres. Kafka is not a substitute for that: the stream consumer
+holds no history and answers a different question (has the last few minutes
+of *inputs* moved) that does not need one. Standing up a broker to replace
+Postgres here - to move the audit trail itself onto Kafka - would still be
+the wrong call for the volume this project runs at; standing one up to feed
+a second, faster-reacting analysis alongside it is a different decision with
+a different justification, made explicitly in stream_consumer.py's own
+module docstring rather than silently overriding this one.
 """
 
 import logging

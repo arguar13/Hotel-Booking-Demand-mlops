@@ -85,11 +85,19 @@ MODEL_REFRESH_SECONDS = float(os.getenv("MODEL_REFRESH_SECONDS", "0"))
 
 # Publishing prediction events to Kafka is entirely optional: it is only
 # attempted when KAFKA_BOOTSTRAP_SERVERS is set, and a Kafka outage must
-# never take down model serving. This gives downstream consumers (drift
-# monitoring, audit logging, feature stores) an async feed of predictions
-# without coupling the request path's availability to Kafka's.
+# never take down model serving. This feeds
+# core_ml/src/monitoring/stream_consumer.py's near-real-time drift
+# early-warning - see that module's docstring for why it exists alongside
+# the batch CronJob rather than instead of it.
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 KAFKA_PREDICTIONS_TOPIC = os.getenv("KAFKA_PREDICTIONS_TOPIC", "predictions")
+# PLAINTEXT locally (docker-compose's single-broker dev Kafka has no TLS
+# listener); the production overlay sets this to "SSL" alongside
+# KAFKA_BOOTSTRAP_SERVERS once terraform/msk.tf is applied - that cluster's
+# encryption_in_transit.client_broker = "TLS" does not expose a plaintext
+# listener at all, so connecting without this would hang until
+# request_timeout_ms and never publish a single event.
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
 _kafka_producer: KafkaProducer | None = None
 
 # Once 5 consecutive publishes fail, stop even trying for 30s: without this,
@@ -224,6 +232,7 @@ def load_kafka_producer():
     try:
         _kafka_producer = KafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            security_protocol=KAFKA_SECURITY_PROTOCOL,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             request_timeout_ms=5000,
         )

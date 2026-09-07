@@ -40,3 +40,25 @@ variable "db_username" {
   type        = string
   default     = "mlops_user"
 }
+
+# ------------------------------------------------------------------
+# MSK (terraform/msk.tf) - feed de eventos de prediccion para
+# core_ml/src/monitoring/stream_consumer.py
+# ------------------------------------------------------------------
+variable "msk_kafka_version" {
+  description = "Version de Kafka del cluster MSK"
+  type        = string
+  default     = "3.9.0"
+}
+
+variable "msk_instance_type" {
+  description = "Tipo de instancia de broker MSK. t3.small alcanza para el volumen de telemetria de este proyecto (early-warning, no un bus de eventos de produccion)"
+  type        = string
+  default     = "kafka.t3.small"
+}
+
+variable "msk_ebs_volume_size" {
+  description = "GiB de almacenamiento EBS por broker MSK"
+  type        = number
+  default     = 100
+}
