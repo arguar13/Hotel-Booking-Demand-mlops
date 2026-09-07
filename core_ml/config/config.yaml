@@ -45,10 +45,6 @@ mlflow:
   experiment_name: "hotel_market_segmentation"
   tracking_uri: "http://localhost:5000"
 
-api:
-  host: "0.0.0.0"
-  port: 8000
-
 # Drift monitoring. Read by the CronJob in kubernetes/base/drift-monitor-cronjob.yaml
 # (src/monitoring/drift_monitor.py), never by the API. Every threshold here is a
 # deliberate operating point, not a default someone forgot to tune - a monitor
