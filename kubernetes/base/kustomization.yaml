@@ -23,6 +23,7 @@ resources:
   - api.yaml
   - dashboard.yaml
   - drift-monitor-cronjob.yaml
+  - stream-consumer.yaml
 
 # Generated rather than declared as a plain resource, so its name carries a
 # hash of its contents. Kustomize rewrites the envFrom references in the
