@@ -33,6 +33,7 @@ psycopg2-binary = "^2.9.9"
 # UI & Monitoreo
 streamlit = "^1.40.0"
 requests = "^2.32.0"
+kafka-python = "^2.0.2" # stream_consumer.py - same pin as api/pyproject.toml's producer
 
 # Transitive-only dependencies (pulled in by mlflow / streamlit / matplotlib),
 # declared here purely to raise their floor above known HIGH/CRITICAL CVEs.
