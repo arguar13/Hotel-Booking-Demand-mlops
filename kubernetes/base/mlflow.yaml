@@ -41,6 +41,17 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # mlflow server is mostly a thin proxy over Postgres/S3, so this is
+          # request-shaped rather than compute-shaped; the limit exists to cap
+          # a single misbehaving upload rather than because steady-state usage
+          # is expected to approach it.
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
           ports:
             - containerPort: 5000
           envFrom:
