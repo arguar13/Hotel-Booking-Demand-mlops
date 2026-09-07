@@ -1,0 +1,9 @@
+# Declared as a resource rather than left to ArgoCD's CreateNamespace sync
+# option: this repo's rule (see gitops/argocd/application.yaml) is that
+# everything running in the cluster traces back to a file here, and a
+# namespace nobody can see in `git log` is exactly the kind of drift that
+# rule exists to prevent.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hotel-mlops

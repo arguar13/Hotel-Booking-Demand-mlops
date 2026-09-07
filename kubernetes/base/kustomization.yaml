@@ -1,7 +1,21 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+# Every namespaced resource below carries an explicit metadata.namespace:
+# hotel-mlops rather than relying on this file's `namespace:` transformer.
+# That transformer stamps every resource it does not recognise as
+# cluster-scoped - ClusterSecretStore (secretstore.yaml) is a CRD, so it does
+# not make that hardcoded list, and the API server then rejects the resulting
+# `metadata.namespace` on a cluster-scoped object. Explicit beats implicit
+# here: it costs one line per resource and never depends on Kustomize's
+# built-in kind list staying in sync with whatever CRDs this repo adds later.
+#
+# A shared cluster namespace (the old `default`) has no RBAC boundary of its
+# own and makes "which IRSA role can reach this ServiceAccount" a question
+# you can only answer by reading every other project's manifests too.
+
 resources:
+  - namespace.yaml
   - serviceaccounts.yaml
   - secretstore.yaml
   - external-secret-db.yaml
@@ -18,6 +32,7 @@ resources:
 # never reaches the running pods.
 configMapGenerator:
   - name: mlops-config
+    namespace: hotel-mlops
     envs:
       - mlops-config.env
 

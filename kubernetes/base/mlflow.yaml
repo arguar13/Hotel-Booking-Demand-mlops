@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mlflow
+  namespace: hotel-mlops
 spec:
   replicas: 1
   selector:
@@ -86,6 +87,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: mlflow-service
+  namespace: hotel-mlops
 spec:
   selector:
     app: mlflow
