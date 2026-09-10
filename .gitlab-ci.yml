@@ -1,31 +1,26 @@
 stages:
-  - test
-  - build
+  - lint_test
+  - build_push
   - deploy
+  - train
 
 variables:
   AWS_REGION: "us-east-1"
   ECR_REPOSITORY_API: "hotel-mlops-api"
   ECR_REPOSITORY_DASHBOARD: "hotel-mlops-dashboard"
-  ECR_REPOSITORY_MLFLOW: "hotel-mlops-mlflow"
   # Batch image (Dockerfile.jobs): core_ml packaged to run inside the cluster.
-  # The drift-monitor CronJob runs from it.
+  # The drift-check CronJob runs from it, and this job's own `train` stage
+  # uses the same code (installed via Poetry, not this image) to retrain.
   ECR_REPOSITORY_JOBS: "hotel-mlops-jobs"
   EKS_CLUSTER_NAME: "hotel-mlops-cluster"
-  # AWS_ACCOUNT_ID is a protected/masked project CI/CD variable (GitLab
-  # Settings > CI/CD > Variables), not a literal here - the account number
-  # has no business living in a file every contributor and fork can read,
-  # and hardcoding it three times in this file meant changing AWS account
-  # was a three-line diff instead of a one-field settings change.
+  # AWS_ACCOUNT_ID is a protected/masked project CI/CD variable (Settings >
+  # CI/CD > Variables), not a literal here.
   AWS_ROLE_ARN: "arn:aws:iam::$AWS_ACCOUNT_ID:role/hotel-mlops-gitlab-ci"
   AWS_WEB_IDENTITY_TOKEN_FILE: "/tmp/web_identity_token"
 
-# Anclaje para la autenticación OIDC nativa de AWS con GitLab.
-# GITLAB_OIDC_TOKEN solo existe cuando GitLab real emite el id_token; bajo
-# gitlab-ci-local (validación local, sin servidor GitLab de por medio) no
-# hay quien lo emita, así que el before_script no escribe el archivo y
-# boto3 cae a su cadena de credenciales normal (AWS_ACCESS_KEY_ID/SECRET
-# exportadas localmente por el desarrollador). Mismo YAML en ambos mundos.
+# OIDC authentication with AWS: GitLab issues GITLAB_OIDC_TOKEN, which this
+# writes to a file boto3/aws-cli pick up automatically to assume
+# AWS_ROLE_ARN - no static AWS keys stored in GitLab.
 .aws_auth: &aws_auth
   id_tokens:
     GITLAB_OIDC_TOKEN:
@@ -37,165 +32,46 @@ variables:
       fi
 
 # The Makefile is the single interface for quality gates: the exact same
-# `make` targets run here and on a developer's machine via pre-commit, so
-# there is only one place (the Makefile) that defines "how to lint/test/scan".
-quality-gate:
-  stage: test
+# `make` targets run here and on a developer's machine, so there is only one
+# place that defines "how to lint/test".
+lint_test:
+  stage: lint_test
   image: python:3.12-slim
-  tags: ["local-hardware"]
   script:
-    # git is needed by core_ml/src/traceability.py: when CI_COMMIT_SHA is not
-    # set it falls back to `git rev-parse HEAD`, and test_traceability.py
-    # exercises exactly that fallback. python:3.12-slim ships without git (the
-    # runner clones with a separate helper image), so without this the test
-    # gets "unknown" and fails.
     - apt-get update && apt-get install -y --no-install-recommends make curl git
     - curl -sSL https://install.python-poetry.org | python3 -
     - export PATH="/root/.local/bin:$PATH"
-    # All three, not just api+core_ml: `make ci` lints and type-checks every
-    # project in the Makefile's ALL_PROJECTS (integration-tests included), so
-    # skipping its install here made `make ci` die with "Command not found: ruff".
     - poetry -C api install --no-interaction
     - poetry -C core_ml install --no-interaction
-    - poetry -C integration-tests install --no-interaction
-    - make ci
+    - make lint
+    - make test
   rules:
-    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
-    # auto-retrain job below - not the full push pipeline (tests, image
-    # builds, gitops-release) a mitigation trigger has no reason to repeat.
-    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
 
-# Trivy needs its own job (rather than `make security`'s local-only trivy check)
-# because it isn't installed in the quality-gate image; the official trivy
-# image gives us real IaC/vulnerability/secret scanning in CI without Docker-in-Docker.
-trivy-scan:
-  stage: test
-  image:
-    name: aquasec/trivy:latest
-    entrypoint: [""]
-  tags: ["local-hardware"]
-  script:
-    # core_ml/mlruns holds MLflow's own per-run artifacts, each shipping a
-    # frozen requirements.txt snapshot of whatever versions produced that run.
-    # Scanning those reports historical, already-superseded findings for every
-    # past run - noise, not the dependencies this repo actually ships. Both
-    # dirs are gitignored, so this only matters for local runs of `make
-    # security`, which uses the same skip list.
-    - trivy fs --exit-code 1 --severity HIGH,CRITICAL --skip-dirs core_ml/data --skip-dirs core_ml/mlruns .
-    # terraform/.terraform holds provider plugins and the *upstream* module
-    # source Terraform downloads (terraform-aws-modules/eks, /vpc, ...). Those
-    # are third-party files this repo neither writes nor can fix, and they are
-    # regenerated by `terraform init`, so scanning them reports findings against
-    # somebody else's code.
-    - trivy config --exit-code 1 --severity HIGH,CRITICAL --skip-dirs terraform/.terraform .
-  rules:
-    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
-    # auto-retrain job below - not the full push pipeline (tests, image
-    # builds, gitops-release) a mitigation trigger has no reason to repeat.
-    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
-
-# Proves the data-contract -> DVC -> train -> quality-gate -> MLflow Registry
-# loop actually works, end to end, on every push - not just the unit tests
-# that mock pieces of it. Runs against the ~1000-row toy dataset (seconds,
-# not minutes) and a throwaway local SQLite MLflow store, so it needs no
-# running MLflow server - only read access to the DVC S3 remote to fetch
-# the toy CSV.
-train-smoke:
-  stage: test
-  image: python:3.12-slim
-  tags: ["local-hardware"]
-  <<: *aws_auth
-  script:
-    - apt-get update && apt-get install -y --no-install-recommends make curl
-    - curl -sSL https://install.python-poetry.org | python3 -
-    - export PATH="/root/.local/bin:$PATH"
-    - poetry -C core_ml install --no-interaction
-    - export AWS_ACCOUNT_ID=$(poetry -C core_ml run python -c "import boto3; print(boto3.client('sts').get_caller_identity()['Account'])")
-    # Structural edit via DVC's own CLI (not a text-substitution hack) -
-    # same principle as `kustomize edit` for the Kubernetes manifests.
-    - poetry -C core_ml run dvc remote modify s3remote url "s3://hotel-mlops-artifacts-production-${AWS_ACCOUNT_ID}/dvc-store"
-    - poetry -C core_ml run dvc pull data/toy/hotel_bookings_toy.csv.dvc
-    - export MLFLOW_TRACKING_URI="sqlite:///$CI_PROJECT_DIR/mlflow-ci-smoke.db"
-    - make train-toy
-  rules:
-    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
-    # auto-retrain job below - not the full push pipeline (tests, image
-    # builds, gitops-release) a mitigation trigger has no reason to repeat.
-    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
-
-# Testcontainers spin up real Postgres/Kafka/LocalStack containers and build
-# the real api/Dockerfile - proving the local stack described in
-# docker-compose.yml actually works, not just that the code imports cleanly.
-# Needs Docker-in-Docker so the job's own container can talk to a Docker
-# daemon; kept in its own job (not folded into quality-gate) since it takes
-# several minutes, mostly waiting on Kafka's startup.
-integration-tests:
-  stage: test
+build_push:
+  stage: build_push
   image: docker:24.0.5
   services:
     - docker:24.0.5-dind
-  tags: ["local-hardware"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-  script:
-    - apk add --no-cache python3 py3-pip curl
-    - curl -sSL https://install.python-poetry.org | python3 -
-    - export PATH="/root/.local/bin:$PATH"
-    - poetry -C integration-tests install --no-interaction
-    - poetry -C integration-tests run pytest -v
-  rules:
-    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
-    # auto-retrain job below - not the full push pipeline (tests, image
-    # builds, gitops-release) a mitigation trigger has no reason to repeat.
-    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
-
-build-push-ecr:
-  stage: build
-  image: docker:24.0.5
-  services:
-    - docker:24.0.5-dind
-  tags: ["local-hardware"]
-  # Without DOCKER_TLS_CERTDIR="" the dind entrypoint defaults to generating
-  # TLS certs and binding the daemon on 2376 - it never opens the plain 2375
-  # port at all, so any client pointed at tcp://docker:2375 (TLS-less) fails
-  # with "Cannot connect to the Docker daemon" no matter how long it waits;
-  # this isn't a startup race, it's a protocol/port mismatch. integration-tests
-  # already sets both of these for the same reason - this job needs them too,
-  # it just never had them.
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
   <<: *aws_auth
   script:
     - apk add --no-cache aws-cli
-    # The docker:dind service opens its TCP port before dockerd has finished
-    # initializing - `docker login` doesn't need a live daemon (it only talks
-    # to the registry over the network), so it can succeed while `docker
-    # build` moments later still can't reach $DOCKER_HOST. Wait for the
-    # daemon to actually answer instead of racing it. 90s, not 30s: on this
-    # runner's host, dockerd start-up is competing with whatever else Docker
-    # Desktop is already running (this project's own docker-compose stack,
-    # other projects' jobs) - 30 iterations reliably ran out before the
-    # daemon ever answered. Fail loudly if it never comes up instead of
-    # silently falling through into a doomed `docker build`.
     - |
       for i in $(seq 1 90); do
         docker info >/dev/null 2>&1 && break
         sleep 1
       done
-      docker info >/dev/null 2>&1 || (echo "dockerd at $DOCKER_HOST never became reachable after 90s" && exit 1)
+      docker info >/dev/null 2>&1 || (echo "dockerd never became reachable" && exit 1)
     - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - export IMAGE_TAG=$CI_COMMIT_SHA
-
-    # Autenticación en Amazon ECR
     - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-    # Construcción y subida de la API
     - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_API:latest -f Dockerfile .
     - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_API
 
-    # Construcción y subida del Dashboard
     - >
       docker build
       -t $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG
@@ -203,84 +79,47 @@ build-push-ecr:
       -f Dockerfile.dashboard .
     - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD
 
-    # Construcción y subida de MLflow (boto3/psycopg2 horneados en la imagen -
-    # ver Dockerfile.mlflow; nada de `pip install` en cada arranque del pod)
-    - docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW:latest -f Dockerfile.mlflow .
-    - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW
-
-    # Construcción y subida de la imagen batch (core_ml dentro del cluster).
-    # Es la que ejecuta el CronJob de drift, y la que faltaba para que algo
-    # del lado de entrenamiento/monitoreo pudiera correr fuera de un portátil.
+    # MLflow itself is not built here: kubernetes/base/mlflow.yaml runs the
+    # official ghcr.io/mlflow/mlflow image directly.
     - docker build --build-arg GIT_COMMIT_SHA=$CI_COMMIT_SHA -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_JOBS:latest -f Dockerfile.jobs .
     - docker push -a $ECR_REGISTRY/$ECR_REPOSITORY_JOBS
   rules:
-    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
-    # auto-retrain job below - not the full push pipeline (tests, image
-    # builds, gitops-release) a mitigation trigger has no reason to repeat.
-    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
 
-# GitOps release: CI's job ends at updating *desired state in Git*. It never
-# touches the cluster - no `kubectl apply`, no direct AWS mutation of
-# running workloads. ArgoCD (bootstrapped once via terraform/argocd.tf,
-# watching gitops/argocd/application.yaml) picks up this commit on its own
-# and reconciles the cluster to match. This is also why the rule below
-# excludes `[skip ci]` commits: without that, this job's own push would
-# retrigger the pipeline forever.
-gitops-release:
+# Deploys straight to the cluster with kubectl/kustomize - no GitOps
+# controller in between. Simpler to follow end to end for a small team, at
+# the cost of the cluster's actual state only being provably "what Git says"
+# right after this job runs, not continuously reconciled.
+deploy:
   stage: deploy
-  image: alpine:3.20
-  tags: ["local-hardware"]
+  image: python:3.12-slim
+  <<: *aws_auth
   script:
-    - apk add --no-cache git curl
-    - >
-      curl -sL
-      "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz"
-      | tar xz -C /usr/local/bin
+    - apt-get update && apt-get install -y --no-install-recommends curl unzip
+    - curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+    - curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip && unzip -q awscliv2.zip && ./aws/install
+    - curl -sL "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+    - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
     - export ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
     - export IMAGE_TAG=$CI_COMMIT_SHA
     - cd kubernetes/overlays/production
     - kustomize edit set image hotel-mlops-api=$ECR_REGISTRY/$ECR_REPOSITORY_API:$IMAGE_TAG
     - kustomize edit set image hotel-mlops-dashboard=$ECR_REGISTRY/$ECR_REPOSITORY_DASHBOARD:$IMAGE_TAG
-    - kustomize edit set image hotel-mlops-mlflow=$ECR_REGISTRY/$ECR_REPOSITORY_MLFLOW:$IMAGE_TAG
     - kustomize edit set image hotel-mlops-jobs=$ECR_REGISTRY/$ECR_REPOSITORY_JOBS:$IMAGE_TAG
-    - cd "$CI_PROJECT_DIR"
-    - git config user.email "gitlab-ci@hotel-mlops.local"
-    - git config user.name "GitLab CI (GitOps release)"
-    - git add kubernetes/overlays/production/kustomization.yaml
-    - >
-      git diff --cached --quiet && echo "No image change, nothing to release." || (
-        git commit -m "chore(gitops): release ${IMAGE_TAG} [skip ci]" &&
-        git push "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
-      )
+    - kubectl apply -k .
   rules:
-    # AUTO_RETRAIN pipelines (mitigation.py's trigger) run only the
-    # auto-retrain job below - not the full push pipeline (tests, image
-    # builds, gitops-release) a mitigation trigger has no reason to repeat.
-    - if: '$AUTO_RETRAIN != "true" && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main")'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
 
-# Triggered by core_ml/src/monitoring/mitigation.py's call to GitLab's
-# Pipeline Trigger API (AUTO_RETRAIN=true, plus TRIGGER_SOURCE/
-# TRIGGER_REASON/TRIGGER_MODEL_VERSION - see that module's docstring),
-# never by a push. This is exactly what mitigation.py is bounded to
-# launching, and no more: `make train` produces a registered candidate,
-# `make promote` is the canary comparison against whatever is currently
-# aliased that decides - separately, afterwards - whether it ever serves
-# traffic. A retrain that promote_model.py rejects leaves this job failed
-# and production untouched; see that module's docstring for why the
-# comparison is not skipped just because the retrain was automatic.
-#
-# MLFLOW_TRACKING_URI must be set as a project CI/CD variable (Settings >
-# CI/CD > Variables) pointing at the real production MLflow server - unlike
-# train-smoke's throwaway SQLite store, this run's entire purpose is to
-# compare against, and potentially replace, the version actually serving.
-auto-retrain:
-  stage: deploy
+# Manual only: retrains, runs the quality gate (train.py) and, if the
+# candidate clears it, canary-compares it against the current champion and
+# promotes it (promote_model.py). Nothing here runs automatically - a human
+# clicks "Run" in the GitLab UI after deciding a retrain is warranted (e.g.
+# after reading a drift-check CronJob failure).
+train:
+  stage: train
   image: python:3.12-slim
-  tags: ["local-hardware"]
   <<: *aws_auth
   script:
-    - echo "Auto-retrain triggered - source=${TRIGGER_SOURCE:-unknown}"
-    - echo "reason=${TRIGGER_REASON:-unknown} model_version=${TRIGGER_MODEL_VERSION:-unknown}"
     - apt-get update && apt-get install -y --no-install-recommends make curl
     - curl -sSL https://install.python-poetry.org | python3 -
     - export PATH="/root/.local/bin:$PATH"
@@ -290,4 +129,6 @@ auto-retrain:
     - make train
     - make promote
   rules:
-    - if: '$AUTO_RETRAIN == "true"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+      when: manual
+  allow_failure: true

@@ -20,8 +20,10 @@ resource "aws_s3_bucket_public_access_block" "artifacts" {
   restrict_public_buckets = true
 }
 
-# Cifrado en reposo con SSE-S3 (AES-256, claves gestionadas por AWS). Ver la
-# entrada AWS-0132 en .trivyignore para por que no se usa una CMK aqui.
+# Cifrado en reposo con SSE-S3 (AES-256, claves gestionadas por AWS). Una CMK
+# propia (KMS) sumaria costo por request y una key policy que mantener, sin
+# comprar nada que este proyecto necesite (no hay dato regulado ni requisito
+# de rotacion on-demand).
 resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
   bucket = aws_s3_bucket.mlflow_dvc_artifacts.id
 

@@ -14,32 +14,36 @@ spec:
         app: mlflow
     spec:
       serviceAccountName: mlflow-sa
-      # UID 1000 is the `mlflowuser` baked into the image (see Dockerfile.mlflow).
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
-        seccompProfile:
-          type: RuntimeDefault
       containers:
         - name: mlflow
-          # Built from Dockerfile.mlflow (boto3/psycopg2 baked in at build
-          # time) - no more installing dependencies over the network on
-          # every pod start. Tag is set per-overlay via `kustomize edit
-          # set image`.
-          image: hotel-mlops-mlflow:local
-          command: ["mlflow", "server"]
+          # The official image (no custom Dockerfile.mlflow to build/push).
+          # Kept in lockstep with the mlflow client pinned in api/ and
+          # core_ml/'s poetry.lock - a 2.x server with a 3.x client is not a
+          # supported combination.
+          image: ghcr.io/mlflow/mlflow:v3.15.2
+          # Using the unmodified upstream image keeps this deployment free of
+          # an extra image to build and publish, at a cost: it does not
+          # bundle the Postgres/S3 drivers, so this installs them at
+          # container start instead. That is also why this container does
+          # NOT run with readOnlyRootFilesystem (see the securityContext
+          # below) - `pip install` needs to write into the image's own
+          # site-packages. A production setup would trade that for a small
+          # custom image built with those drivers baked in, to avoid paying
+          # this install on every pod start and to restore the read-only
+          # root filesystem.
+          command: ["sh", "-c"]
           args:
-            - "--backend-store-uri=postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(POSTGRES_DB)"
-            - "--default-artifact-root=s3://$(S3_BUCKET_NAME)/mlflow"
-            # See MLFLOW_ALLOWED_HOSTS in kubernetes/base/configmap.yaml.
-            - "--allowed-hosts=$(MLFLOW_ALLOWED_HOSTS)"
-            - "--host=0.0.0.0"
-            - "--port=5000"
+            - |
+              pip install --no-cache-dir psycopg2-binary boto3 && \
+              mlflow server \
+                --backend-store-uri=postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(POSTGRES_DB) \
+                --default-artifact-root=s3://$(S3_BUCKET_NAME)/mlflow \
+                --allowed-hosts=$(MLFLOW_ALLOWED_HOSTS) \
+                --host=0.0.0.0 \
+                --port=5000
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
+            readOnlyRootFilesystem: false
             capabilities:
               drop: ["ALL"]
           # mlflow server is mostly a thin proxy over Postgres/S3, so this is
@@ -60,13 +64,6 @@ spec:
                 name: mlops-secrets
             - configMapRef:
                 name: mlops-config
-          # Read-only root filesystem: MLflow stages artifacts through a temp
-          # dir before pushing them to S3, and keeps its client cache in $HOME.
-          volumeMounts:
-            - name: tmp
-              mountPath: /tmp
-            - name: home
-              mountPath: /home/mlflowuser
           readinessProbe:
             tcpSocket:
               port: 5000
@@ -77,11 +74,6 @@ spec:
               port: 5000
             initialDelaySeconds: 30
             periodSeconds: 20
-      volumes:
-        - name: tmp
-          emptyDir: {}
-        - name: home
-          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

@@ -1,52 +1,26 @@
-"""Promotion: the canary/shadow gate between a registered model version and
-the alias production actually serves.
+"""Promotion: the gate between a registered model version and the alias
+production actually serves.
 
-train.py's quality gate is absolute - min_f1_threshold - and deliberately
-stops there (see its own comment): clearing a floor says nothing about
-whether a version is better or worse than the one already aliased. A
-retrain triggered by mitigation.py after a confirmed ALERT is exactly the
-case where that gap matters most - a challenger trained on the same
-drifted data the monitor just flagged could clear the floor and still be
-worse than what it would replace. drift_monitor.py's original design
-explicitly refused to let any retrain reach production unattended; this
-module is the thing that now stands between "a version exists" and "a
-version serves traffic", for every promotion, not only automated ones -
-a manual retrain that regresses deserves the same check.
+train.py's quality gate is absolute (`min_f1_threshold`) and deliberately
+stops there: clearing a floor says nothing about whether a new version is
+better or worse than the one already serving. This module is the direct
+comparison that answers that question, for every promotion (manual or after
+a retrain) - not just an absolute floor.
 
-**What "canary/shadow" means here, and the trade-off in that.** The most
-rigorous version of this check would re-score the challenger and the
-champion against a replayed, held-out slice of *current* production
-traffic - a true shadow deployment. This project does not build that; it
-would need a labelled slice kept back from both models and a second
-inference path running unpromoted challengers against live requests, real
-infrastructure this project's traffic volume does not justify building
-(the same class of trade-off already made explicitly for Kafka in
-api/monitoring.py). Instead, both figures come from each version's own
-`monitoring/reference_profile.json` - `performance.f1_weighted`, already
-logged by train.py against that run's own held-out test split. That is a
-weaker guarantee than a live comparison: the two splits are not the same
-rows if the underlying dataset changed between the two training runs. But
-it is the exact standard drift_monitor.py's own concept drift check
-already holds a *serving* model to - comparing live F1 against a
-baseline_f1 read from this same field, never re-scoring the champion live
-- so a challenger is measured by the same yardstick production already is,
-rather than a second, invented one.
-
-**The gate.** challenger.f1_weighted must be no more than `canary_tolerance`
-below champion.f1_weighted (config.yaml's `model.canary_tolerance` - a
-small negative number, not zero; see that file's comment for why requiring
-a strict improvement on every retrain is the wrong bar). No version
-currently aliased (first deployment) always promotes - there is nothing to
-compare against.
+**The gate.** Both the candidate's and the current champion's weighted F1
+come from each version's own `monitoring/reference_profile.json`
+(`performance.f1_weighted`), logged by train.py against that run's held-out
+test split - no live re-scoring, no separate shadow-traffic deployment. The
+candidate must score no more than `canary_tolerance` below the champion
+(config.yaml's `model.canary_tolerance` - a small negative number, not zero,
+so a candidate that recovers most but not all of a regression can still
+ship). No version currently aliased (first deployment) always promotes -
+there is nothing to compare against.
 
 **Rollback.** Every promotion tags the new version with
 `promoted_from_version`, the version it replaced ("none" for a bootstrap
 promotion). `--rollback` reads that tag off whatever is currently aliased
-and moves the alias back exactly one step. Deliberately one step, not a
-full history walk: automatically unwinding more than one promotion without
-a human choosing which earlier version is actually safe is exactly the
-kind of unattended authority mitigation.py's own docstring argues against
-granting this system.
+and moves the alias back exactly one step.
 """
 
 from __future__ import annotations
@@ -60,7 +34,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
 from src.config_loader import load_config
-from src.monitoring.drift_monitor import load_reference_profile
+from src.monitoring.drift_check import load_reference_profile
 
 log = structlog.get_logger("hotel_mlops.promote_model")
 
@@ -104,9 +78,9 @@ def promote(run_id: str, config: dict | None = None) -> str:
     """Promote the model version produced by `run_id`, if it clears the canary bar.
 
     Returns the promoted version's registry version number. Raises
-    PromotionError on rejection - the caller (CI, a human, or mitigation.py's
-    own pipeline) decides what a rejection means; this function's job is
-    only to decide the verdict and record it.
+    PromotionError on rejection - the caller (CI or a human running this by
+    hand) decides what a rejection means; this function's job is only to
+    decide the verdict and record it.
     """
     config = config or load_config()
     model_config = config["model"]

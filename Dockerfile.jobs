@@ -4,16 +4,14 @@
 # run from a developer's laptop against the MLflow load balancer - the repo
 # shipped three images (api, dashboard, mlflow) and none of them contained the
 # ML code. That made "run something on a schedule against production"
-# impossible, which is why the drift monitor needed this image before it needed
+# impossible, which is why the drift check needed this image before it needed
 # a single line of statistics.
 #
-# One image, several entrypoints. The drift CronJob overrides `command:` with
-# `python -m src.monitoring.drift_monitor`; the stream-consumer Deployment
-# (kubernetes/base/stream-consumer.yaml) overrides it with
-# `python -m src.monitoring.stream_consumer`; a scheduled retrain would
-# override it with `python -m src.train` and need nothing else built.
-# Splitting them into separate images would mean multiple Dockerfiles, ECR
-# repositories and builds carrying byte-identical dependency layers.
+# One image, several entrypoints. The drift-check CronJob overrides `command:`
+# with `python -m src.monitoring.drift_check`; a manual retrain uses
+# `python -m src.train` followed by `python -m src.promote_model`. Splitting
+# them into separate images would mean multiple Dockerfiles, ECR repositories
+# and builds carrying byte-identical dependency layers.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -74,4 +72,4 @@ USER appuser
 ENV HOME=/home/appuser
 
 # Overridden per workload; this is the one that runs on a schedule today.
-CMD ["python", "-m", "src.monitoring.drift_monitor"]
+CMD ["python", "-m", "src.monitoring.drift_check"]

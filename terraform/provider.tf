@@ -30,44 +30,15 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.31"
-    }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.14"
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
     }
   }
 }
 
 provider "aws" {
   region = var.aws_region
-}
-
-# Autenticacion contra el cluster EKS recien creado, reutilizada por los
-# providers kubernetes/helm de abajo (bootstrap de ArgoCD y External
-# Secrets - ver argocd.tf y external-secrets.tf).
-data "aws_eks_cluster_auth" "this" {
-  name = module.eks.cluster_name
-}
-
-provider "kubernetes" {
-  host                   = module.eks.cluster_endpoint
-  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-  token                  = data.aws_eks_cluster_auth.this.token
-}
-
-provider "helm" {
-  kubernetes {
-    host                   = module.eks.cluster_endpoint
-    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-    token                  = data.aws_eks_cluster_auth.this.token
-  }
 }
 
 # Obtiene la identidad actual (Account ID)

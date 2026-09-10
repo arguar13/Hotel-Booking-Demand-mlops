@@ -17,12 +17,12 @@ scikit-learn = ">=1.4.0" #[cite: 27]
 imbalanced-learn = "^0.14.0" # <0.14 is incompatible with the resolved scikit-learn>=1.6/1.7
 optuna = "^3.5.0" #[cite: 27]
 pandera = "^0.20.4"
+scipy = "^1.13.0" # the z-test in src/monitoring/drift_check.py
 structlog = "^26.1.0" # JSON logs (CloudWatch/ELK-friendly), same approach as api/
 
 # MLOps & Infraestructura
 # Version floors, not exact pins: poetry.lock is what makes a build
-# reproducible, so pinning here too only blocks security patches. These
-# floors are the ones the `trivy fs` gate in .gitlab-ci.yml requires.
+# reproducible, so pinning here too would only block security patches.
 mlflow = "^3.15.0"     # 2.11.3 carried 35 HIGH/CRITICAL CVEs; also pulls fixed
                        # gunicorn/protobuf/pyarrow transitively
 setuptools = "^78.1.1" # mlflow imports pkg_resources at runtime; >=78.1.1 fixes CVE-2025-47273
@@ -33,7 +33,6 @@ psycopg2-binary = "^2.9.9"
 # UI & Monitoreo
 streamlit = "^1.40.0"
 requests = "^2.32.0"
-kafka-python = "^2.0.2" # stream_consumer.py - same pin as api/pyproject.toml's producer
 
 # Transitive-only dependencies (pulled in by mlflow / streamlit / matplotlib),
 # declared here purely to raise their floor above known HIGH/CRITICAL CVEs.
@@ -48,15 +47,11 @@ pydantic = "^2.0.0" # Permitimos la versión moderna para estas herramientas[cit
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.3"
 pytest-cov = "^6.0.0"
-black = "^24.10.0"
 ruff = "^0.13.0"
-isort = "^5.13.2"
 mypy = "^1.13.0"
-bandit = {extras = ["toml"], version = "^1.7.10"}
 pre-commit = "^4.0.1"
 types-pyyaml = "^6.0.12"
 types-requests = "^2.32.0"
-yamllint = "^1.38.0"
 
 [build-system]
 requires = ["poetry-core"]
@@ -70,14 +65,9 @@ target-version = "py312"
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
 
-[tool.black]
-line-length = 100
-target-version = ["py312"]
-
-[tool.isort]
-profile = "black"
-line_length = 100
-known_first_party = ["src", "dashboard"]
+[tool.ruff.format]
+# `ruff format` replaces black+isort: it formats code the same way black does
+# and sorts imports the same way the "I" rule above does.
 
 [tool.mypy]
 python_version = "3.12"

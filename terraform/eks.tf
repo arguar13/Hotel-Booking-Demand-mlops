@@ -14,37 +14,37 @@ module "eks" {
   # Sin esto, NADA puede autenticarse contra el cluster recien creado.
   # A partir de la v20 del modulo, el principal IAM que crea el cluster ya no
   # recibe permisos de Kubernetes automaticamente: EKS Access Entries
-  # reemplazo al viejo ConfigMap aws-auth, y sin una entrada explicita el
-  # propio `terraform apply` falla con "Unauthorized" en cuanto los providers
-  # kubernetes/helm intentan crear algo (los namespaces y los Helm releases de
-  # ArgoCD y External Secrets, mas abajo en este mismo apply).
+  # reemplazo al viejo ConfigMap aws-auth, y sin una entrada explicita
+  # `kubectl` (a mano o desde el job `deploy` de CI) falla con "Unauthorized".
   # Esto crea la access entry del creador con la politica AmazonEKSClusterAdminPolicy.
   enable_cluster_creator_admin_permissions = true
 
-  # Habilita OpenID Connect (OIDC) para usar IRSA (IAM Roles for Service Accounts)
-  enable_irsa = true
+  # Sin IRSA (IAM Roles for Service Accounts): en vez de un rol IAM distinto
+  # por ServiceAccount, el unico node group de abajo lleva la politica de S3
+  # que la API y MLflow necesitan (ver iam_role_additional_policies). Es
+  # menos granular - cualquier pod en el nodo hereda ese acceso a S3 en vez
+  # de solo el ServiceAccount que lo declara - pero para un solo node group
+  # y un solo bucket, evita levantar el proveedor OIDC y un rol por servicio.
+  enable_irsa = false
 
   eks_managed_node_groups = {
+    # Un unico node group: para el volumen de este proyecto no hace falta
+    # separar pools por tipo de carga (serving vs. batch); todo corre sobre
+    # las mismas instancias t3.medium.
     general = {
-      # Bumped from 2 to 3 (still within the pre-existing max_size) after
-      # ip-10-0-2-176 went NotReady (kubelet stopped posting status) mid
-      # rollout: its pods stuck in Terminating (can't be force-deleted
-      # without direct node/pod-deletion access) left the one healthy node
-      # at its hard 17-pod ENI limit for t3.medium, blocking the correctly
-      # configured api replica from ever scheduling. Adding real capacity
-      # instead of fighting Kubernetes' own node-eviction bookkeeping.
-      # Note: the eks module ignores drift on scaling_config.desired_size
-      # (an external autoscaler is expected to own it after creation), so
-      # this edit alone does not resize anything - the actual scale-up used
-      # `aws eks update-nodegroup-config`. This value is kept in sync with
-      # that so a future `terraform apply` does not try to fight it back
-      # down to 2.
-      desired_size = 3
+      desired_size = 2
       min_size     = 1
       max_size     = 3
 
       instance_types         = ["t3.medium"]
       vpc_security_group_ids = [aws_security_group.eks_nodes_sg.id]
+
+      # Da a cualquier pod del cluster (api, mlflow, jobs) acceso de
+      # lectura/escritura al bucket de artefactos S3, sin un rol IAM por
+      # ServiceAccount - ver iam.tf.
+      iam_role_additional_policies = {
+        s3_artifacts = aws_iam_policy.artifacts_bucket_rw.arn
+      }
     }
   }
 
