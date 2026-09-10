@@ -13,9 +13,8 @@ services:
       timeout: 5s
       retries: 5
 
-  # AWS emulator (S3, SQS, Secrets Manager) - lets MLflow, DVC, and the
-  # integration tests exercise real S3/SQS/Secrets Manager API calls
-  # without touching a real AWS account. Pinned to 4.14.0: LocalStack
+  # AWS emulator (S3 only) - lets MLflow and DVC exercise real S3 API calls
+  # locally without touching a real AWS account. Pinned to 4.14.0: LocalStack
   # versions from 2026.03.0 onward require a free account + auth token
   # (LOCALSTACK_AUTH_TOKEN) even for community services, which would add
   # a signup step to what should be a zero-setup local stack. Upgrade path:
@@ -24,7 +23,7 @@ services:
   localstack:
     image: localstack/localstack:4.14.0
     environment:
-      - SERVICES=s3,sqs,secretsmanager
+      - SERVICES=s3
       - DEBUG=0
       - PERSISTENCE=0
     ports:
@@ -37,42 +36,14 @@ services:
       timeout: 5s
       retries: 10
 
-  # Single-broker Kafka in KRaft mode (no ZooKeeper needed), using the
-  # official Apache Kafka image. Backs the optional prediction-event feed
-  # the API publishes to (see api/main.py); nothing breaks if this service
-  # isn't running - the API just skips publishing.
-  kafka:
-    image: apache/kafka:3.8.0
-    environment:
-      - KAFKA_NODE_ID=1
-      - KAFKA_PROCESS_ROLES=broker,controller
-      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
-      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
-      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
-      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
-      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
-    ports:
-      # Host-side 19092, not the Kafka-default 9092: that's only for tools on
-      # this machine reaching in (kafka-console-consumer, kcat, ...) - the
-      # api/mlflow containers talk to this broker over the internal Docker
-      # network as `kafka:9092` regardless of the host mapping, so remapping
-      # it here does not touch inter-container traffic. Kept off 9092 since
-      # that's a commonly-already-bound default on a dev machine running more
-      # than one Kafka-backed stack side by side.
-      - "19092:9092"
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-
   mlflow:
-    build:
-      context: .
-      dockerfile: Dockerfile.mlflow
+    # Official image, not a custom Dockerfile: simpler to reason about, at
+    # the cost of installing the Postgres/S3 drivers (not bundled upstream)
+    # every time the container starts instead of baking them into an image
+    # once. Kept in lockstep with the mlflow client pinned in api/ and
+    # core_ml/'s poetry.lock - a 2.x server with a 3.x client is not a
+    # supported combination.
+    image: ghcr.io/mlflow/mlflow:v3.15.2
     # --allowed-hosts: MLflow >=3 rejects any request whose Host header it does
     # not recognise ("possible DNS rebinding attack"), and the default list is
     # localhost + private IPs only. The api and dashboard containers reach this
@@ -84,11 +55,12 @@ services:
     # to reach `mlflow:5000` over the internal Docker network) - so both
     # must be listed.
     command: >
+      sh -c "pip install --no-cache-dir psycopg2-binary boto3 &&
       mlflow server
       --backend-store-uri postgresql://mlops_user:mlops_password@db:5432/mlflow_db
       --default-artifact-root s3://mlflow-artifacts/
       --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5050,127.0.0.1,127.0.0.1:5050
-      --host 0.0.0.0 --port 5000
+      --host 0.0.0.0 --port 5000"
     environment:
       # Dummy credentials LocalStack accepts unconditionally; points MLflow's
       # S3 artifact store at LocalStack instead of real AWS.
@@ -100,10 +72,9 @@ services:
       # Host-side 5050, not MLflow's default 5000: 5000 is a very common
       # default (Flask, kubectl port-forward, other MLflow stacks) to
       # already be bound on a dev machine running more than one project.
-      # Same principle as Kafka's 19092 remap above - api/dashboard reach
-      # this service over the internal Docker network as `mlflow:5000`
-      # regardless of the host mapping, so this only affects host-machine
-      # browser/CLI access to the MLflow UI.
+      # api/dashboard reach this service over the internal Docker network as
+      # `mlflow:5000` regardless of the host mapping, so this only affects
+      # host-machine browser/CLI access to the MLflow UI.
       - "5050:5000"
     depends_on:
       db:
@@ -119,12 +90,11 @@ services:
       - "8000:8000"
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       # Same LocalStack S3 credentials/endpoint as the mlflow service above:
       # mlflow.sklearn.load_model() pulls the model artifact straight from
       # the s3:// artifact store via boto3, so the API needs S3 access too,
-      # not just the mlflow server itself. In production this is IRSA
-      # (api-sa's IAM role, see terraform/iam.tf) instead of static keys.
+      # not just the mlflow server itself. In production this is the EKS
+      # node group's own IAM role (see terraform/eks.tf) instead of static keys.
       - AWS_ACCESS_KEY_ID=test
       - AWS_SECRET_ACCESS_KEY=test
       - AWS_DEFAULT_REGION=us-east-1
@@ -145,8 +115,6 @@ services:
         condition: service_healthy
       mlflow:
         condition: service_started
-      kafka:
-        condition: service_started
       localstack:
         condition: service_healthy
 
@@ -161,12 +129,13 @@ services:
     depends_on:
       - api
 
-  # The drift monitor, as a one-shot container - the same image and the same
-  # entrypoint the production CronJob runs (Dockerfile.jobs), so the loop can be
-  # exercised end to end on a laptop before it is ever scheduled in EKS. Behind
-  # a profile because it is a job, not a service: `make up` must not start it.
-  # Run it with `make drift-report` after `make replay` has produced traffic.
-  drift-monitor:
+  # The drift check, as a one-shot container - the same image and the same
+  # entrypoint the production CronJob runs (Dockerfile.jobs), so the loop can
+  # be exercised end to end on a laptop before it is ever scheduled in EKS.
+  # Behind a profile because it is a job, not a service: `make up` must not
+  # start it. Run it with `make drift-check` after `make replay` has produced
+  # traffic.
+  drift-check:
     build:
       context: .
       dockerfile: Dockerfile.jobs
@@ -187,48 +156,3 @@ services:
         condition: service_healthy
       mlflow:
         condition: service_started
-
-  # core_ml/src/monitoring/stream_consumer.py against this stack's own
-  # Kafka - the only way to exercise it end to end without touching the
-  # real MSK cluster terraform/msk.tf provisions. GITLAB_* deliberately
-  # unset: mitigation.py's trigger call then fails, is caught, and is
-  # recorded as "failed" - the correct behaviour for testing drift
-  # detection locally without launching a real GitLab pipeline.
-  stream-consumer:
-    build:
-      context: .
-      dockerfile: Dockerfile.jobs
-    command: ["python", "-m", "src.monitoring.stream_consumer"]
-    profiles: ["jobs"]
-    environment:
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - DB_HOST=db
-      - DB_PORT=5432
-      - POSTGRES_USER=mlops_user
-      - POSTGRES_PASSWORD=mlops_password
-      - POSTGRES_DB=mlflow_db
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_SECURITY_PROTOCOL=PLAINTEXT
-    depends_on:
-      db:
-        condition: service_healthy
-      mlflow:
-        condition: service_started
-      kafka:
-        condition: service_healthy
-
-  # Real GitLab Runner, registered against this project, so CI jobs can be
-  # validated on this machine before they're ever pushed (`gitlab-runner
-  # exec` was removed from GitLab Runner - this is the current supported
-  # way to run a runner locally). Not started by `make up`; see `make
-  # runner-register` / `make runner-start`, both gated behind the
-  # `ci-local` profile so it never interferes with the app stack above.
-  gitlab-runner:
-    image: gitlab/gitlab-runner:latest
-    profiles: ["ci-local"]
-    volumes:
-      - gitlab-runner-config:/etc/gitlab-runner
-      - /var/run/docker.sock:/var/run/docker.sock
-
-volumes:
-  gitlab-runner-config:

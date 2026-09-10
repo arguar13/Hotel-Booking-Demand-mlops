@@ -1,7 +1,18 @@
-# Scoped to the artifacts bucket only (not a blanket S3FullAccess/
-# AmazonS3ReadOnlyAccess managed policy) - both mlflow (artifact store)
-# and the api (loading models from that same store) only ever need this
-# one bucket.
+# El cluster EKS y el node group ya reciben sus propios roles IAM del modulo
+# terraform-aws-modules/eks/aws (eks.tf) - no hace falta declararlos a mano.
+# Lo que este archivo si declara:
+#
+#   1. La politica de S3 que la API, MLflow y los jobs batch necesitan para
+#      leer/escribir el bucket de artefactos - adjuntada directamente al rol
+#      IAM del node group (ver eks.tf's iam_role_additional_policies), en vez
+#      de un rol IRSA por ServiceAccount. Es menos granular (cualquier pod
+#      del nodo hereda el acceso), pero evita levantar el proveedor OIDC y
+#      mantener un rol por servicio para un unico node group y un unico
+#      bucket. Con varios equipos compartiendo el cluster, un rol IRSA por
+#      ServiceAccount pasa a valer la pena.
+#   2. El rol que CI (GitLab) asume via OIDC para construir/publicar
+#      imagenes, leer/escribir el bucket de DVC y desplegar con kubectl.
+
 data "aws_iam_policy_document" "artifacts_bucket_rw" {
   statement {
     effect = "Allow"
@@ -22,144 +33,12 @@ resource "aws_iam_policy" "artifacts_bucket_rw" {
   policy = data.aws_iam_policy_document.artifacts_bucket_rw.json
 }
 
-# IRSA (IAM Roles for Service Accounts) para MLflow
-module "mlflow_irsa_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.30"
-
-  role_name = "${var.project_name}-mlflow-irsa"
-
-  role_policy_arns = {
-    artifacts_bucket_rw = aws_iam_policy.artifacts_bucket_rw.arn
-  }
-
-  oidc_providers = {
-    main = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["hotel-mlops:mlflow-sa"]
-    }
-  }
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-output "mlflow_iam_role_arn" {
-  value       = module.mlflow_irsa_role.iam_role_arn
-  description = "ARN del rol IAM para el ServiceAccount mlflow-sa"
-}
-
-module "api_irsa_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.30"
-
-  role_name = "${var.project_name}-api-irsa"
-
-  role_policy_arns = {
-    artifacts_bucket_rw = aws_iam_policy.artifacts_bucket_rw.arn
-  }
-
-  oidc_providers = {
-    main = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["hotel-mlops:api-sa"]
-    }
-  }
-}
-
-output "api_iam_role_arn" {
-  value = module.api_irsa_role.iam_role_arn
-}
-
-# IRSA for in-cluster batch workloads (the drift-monitor CronJob today). It
-# needs the same artifacts bucket the API and MLflow use - read, to pull the
-# reference profile logged with the served model version; write, because the
-# drift report it produces is itself an MLflow artifact - but it is a distinct
-# workload with a distinct lifecycle, so it gets a distinct role rather than
-# borrowing api-sa's. Reusing the serving identity would mean every permission
-# a future batch job needs is silently granted to the internet-facing API too.
-module "jobs_irsa_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.30"
-
-  role_name = "${var.project_name}-jobs-irsa"
-
-  role_policy_arns = {
-    artifacts_bucket_rw = aws_iam_policy.artifacts_bucket_rw.arn
-  }
-
-  oidc_providers = {
-    main = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["hotel-mlops:jobs-sa"]
-    }
-  }
-
-  tags = {
-    Environment = var.environment
-  }
-}
-
-output "jobs_iam_role_arn" {
-  value       = module.jobs_irsa_role.iam_role_arn
-  description = "ARN to annotate on the jobs-sa ServiceAccount (drift-monitor CronJob)"
-}
-
 # ============================================================
-# IRSA para External Secrets Operator: lee AWS Secrets Manager y
-# materializa Secrets de Kubernetes a partir de un ExternalSecret
-# declarado en Git (kubernetes/base/external-secret-db.yaml) - el
-# valor del secreto nunca vive en el repo, solo la *referencia* a él.
-# ============================================================
-data "aws_iam_policy_document" "external_secrets_read" {
-  statement {
-    effect = "Allow"
-    actions = [
-      "secretsmanager:GetSecretValue",
-      "secretsmanager:DescribeSecret",
-    ]
-    resources = [
-      "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${var.project_name}/*"
-    ]
-  }
-}
-
-resource "aws_iam_policy" "external_secrets_read" {
-  name   = "${var.project_name}-external-secrets-read"
-  policy = data.aws_iam_policy_document.external_secrets_read.json
-}
-
-module "external_secrets_irsa_role" {
-  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  version = "~> 5.30"
-
-  role_name = "${var.project_name}-external-secrets-irsa"
-
-  role_policy_arns = {
-    secretsmanager_read = aws_iam_policy.external_secrets_read.arn
-  }
-
-  oidc_providers = {
-    main = {
-      provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["external-secrets:external-secrets-sa"]
-    }
-  }
-}
-
-output "external_secrets_iam_role_arn" {
-  value       = module.external_secrets_irsa_role.iam_role_arn
-  description = "ARN a anotar en kubernetes/base/external-secrets-serviceaccount.yaml"
-}
-
-# ============================================================
-# OIDC federation para GitLab CI/CD - reemplaza al viejo
-# assume_role_policy roto (confiaba en "ec2.amazonaws.com", que
-# nunca puede emitir el token web-identity que .gitlab-ci.yml
-# realmente envía). GitLab expone su propio emisor OIDC vía
-# `id_tokens:` (ver .gitlab-ci.yml); aquí se registra como
-# proveedor y se restringe qué proyecto/rama puede asumir el rol.
+# OIDC federation para GitLab CI/CD - permite a .gitlab-ci.yml asumir un rol
+# de AWS sin credenciales estaticas (access key/secret) guardadas en GitLab.
+# GitLab expone su propio emisor OIDC vía `id_tokens:` (ver .gitlab-ci.yml);
+# aca se lee el proveedor (normalmente ya registrado por otro proyecto de la
+# misma cuenta) y se restringe que solo este proyecto/rama pueda asumir el rol.
 # ============================================================
 variable "gitlab_oidc_issuer_url" {
   description = "URL del emisor OIDC de GitLab (https://gitlab.com para SaaS, o la URL de tu instancia self-managed)"
@@ -173,26 +52,14 @@ variable "gitlab_project_path" {
   default     = "CHANGE_ME/hotel-mlops"
 }
 
-# An IAM OIDC provider is a singleton per issuer URL *for the whole AWS
-# account*, not per Terraform state - a second `resource` block trying to
-# create "https://gitlab.com" again fails with EntityAlreadyExists the moment
-# any other project in this account has already registered it (verified here:
-# it already exists, created by a different project's Terraform, tagged
-# accordingly). Reading it as data instead of managing it as a resource means
-# this configuration adopts whichever provider is already there - with the
-# same client_id_list/thumbprint any GitLab.com issuer produces regardless of
-# who created it - without ever creating or destroying an account-wide
-# resource a sibling project also depends on.
+# Un proveedor OIDC IAM es un singleton por URL de emisor *para toda la
+# cuenta de AWS*, no por estado de Terraform - se lee como data en vez de
+# gestionarse como resource para adoptar el que ya exista sin crear ni
+# destruir un recurso de toda la cuenta del que puede depender otro proyecto.
 data "aws_iam_openid_connect_provider" "gitlab" {
   url = var.gitlab_oidc_issuer_url
 }
 
-# Named "GitLabCIRole" until this deployment: a bare, unprefixed name that
-# collided with an identically-named role from another project in this same
-# AWS account (each with its own OIDC trust condition scoped to a different
-# gitlab_project_path) - IAM role names are unique per account, not per
-# Terraform state. Prefixed with project_name like every other resource here
-# to make that collision structurally impossible going forward.
 resource "aws_iam_role" "gitlab_ci_role" {
   name = "${var.project_name}-gitlab-ci"
 
@@ -218,48 +85,36 @@ resource "aws_iam_role" "gitlab_ci_role" {
   })
 }
 
-# CI solo necesita: (1) publicar imagenes en ECR, (2) leer/escribir el
-# bucket de artefactos S3 (DVC push/pull, lectura de datasets), y
-# (3) leer el secreto de RDS para el smoke test de entrenamiento.
-# Ya NO necesita permisos de EKS: con GitOps, CI nunca llama a
-# `kubectl apply` - ArgoCD reconcilia el cluster desde Git de forma
-# independiente (ver gitops/argocd/application.yaml).
+# CI necesita: (1) publicar imagenes en ECR, (2) leer/escribir el bucket de
+# artefactos S3 (DVC push/pull, lectura del dataset), y (3) desplegar con
+# `kubectl apply -k` en el job `deploy` de .gitlab-ci.yml.
 resource "aws_iam_role_policy_attachment" "gitlab_ci_ecr_push" {
   role       = aws_iam_role.gitlab_ci_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser"
 }
 
-data "aws_iam_policy_document" "gitlab_ci_s3_dvc" {
-  statement {
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:ListBucket",
-    ]
-    resources = [
-      aws_s3_bucket.mlflow_dvc_artifacts.arn,
-      "${aws_s3_bucket.mlflow_dvc_artifacts.arn}/*",
-    ]
-  }
-
-  statement {
-    effect = "Allow"
-    actions = [
-      "secretsmanager:GetSecretValue",
-    ]
-    resources = [data.aws_secretsmanager_secret.db_password.arn]
-  }
-}
-
-resource "aws_iam_policy" "gitlab_ci_s3_dvc" {
-  name   = "${var.project_name}-gitlab-ci-s3-dvc"
-  policy = data.aws_iam_policy_document.gitlab_ci_s3_dvc.json
-}
-
 resource "aws_iam_role_policy_attachment" "gitlab_ci_s3_dvc" {
   role       = aws_iam_role.gitlab_ci_role.name
-  policy_arn = aws_iam_policy.gitlab_ci_s3_dvc.arn
+  policy_arn = aws_iam_policy.artifacts_bucket_rw.arn
+}
+
+# Da a gitlab_ci_role permiso de kubectl sobre el cluster (EKS Access Entry).
+# AmazonEKSAdminPolicy es intencionalmente amplia para este alcance: en un
+# entorno real, restringila a la namespace hotel-mlops con una politica de
+# acceso mas angosta.
+resource "aws_eks_access_entry" "gitlab_ci" {
+  cluster_name  = module.eks.cluster_name
+  principal_arn = aws_iam_role.gitlab_ci_role.arn
+}
+
+resource "aws_eks_access_policy_association" "gitlab_ci_admin" {
+  cluster_name  = module.eks.cluster_name
+  principal_arn = aws_iam_role.gitlab_ci_role.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
 }
 
 output "gitlab_ci_role_arn" {

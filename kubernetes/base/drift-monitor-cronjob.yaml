@@ -1,19 +1,18 @@
-# The drift monitor, on a schedule.
+# The drift check, on a schedule.
 #
 # A CronJob rather than a workflow engine: this is one container, run once a
 # day, with no fan-out and no inter-task dependencies. Airflow, Argo Workflows
 # or Step Functions would each add a control plane to operate, upgrade and
 # secure in exchange for scheduling semantics Kubernetes already has natively -
 # the same reasoning that kept Kustomize instead of Helm for this repo's own
-# manifests. When there is a second task with a real dependency on the first,
-# that trade changes; today it does not.
+# manifests.
 #
 # It is also the first workload here that is *not* a long-running service, which
 # is why it is the workload that required Dockerfile.jobs to exist at all.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: drift-monitor
+  name: drift-check
   namespace: hotel-mlops
 spec:
   # 04:00 UTC daily: after the overnight reconciliation window that supplies
@@ -22,10 +21,8 @@ spec:
   schedule: "0 4 * * *"
   timeZone: "Etc/UTC"
 
-  # Forbid, not Allow: two monitors reading overlapping windows would log two
-  # contradictory verdicts for the same period into MLflow, and the hysteresis
-  # counter (which reads back its own run history) would count one slow run
-  # twice and escalate on a single window.
+  # Forbid, not Allow: two checks reading overlapping windows would log two
+  # runs for the same period into MLflow for no reason.
   concurrencyPolicy: Forbid
 
   # If the controller was down when the schedule fired, only start a missed run
@@ -61,14 +58,13 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           containers:
-            - name: drift-monitor
+            - name: drift-check
               # Tag set per-overlay via `kustomize edit set image`, exactly like
-              # the three service images - CI writes the freshly-built
-              # $IMAGE_TAG here and commits (see .gitlab-ci.yml's
-              # gitops-release job).
+              # the other images - CI's `build_push` job writes the
+              # freshly-built $IMAGE_TAG here (see .gitlab-ci.yml's `deploy` job).
               image: hotel-mlops-jobs:local
               imagePullPolicy: Always
-              command: ["python", "-m", "src.monitoring.drift_monitor"]
+              command: ["python", "-m", "src.monitoring.drift_check"]
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true
@@ -82,20 +78,19 @@ spec:
                     name: mlops-secrets
                 - configMapRef:
                     name: mlops-config
-              # Bounded on purpose. The job pulls a capped window into a
-              # DataFrame and runs a 1000-resample bootstrap; the limit is what
-              # turns "the window was unexpectedly enormous" into a failed job
-              # with a clear reason instead of an evicted node.
+              # Bounded on purpose: the job pulls a capped window into a
+              # DataFrame, so a traffic spike fails the job with a clear
+              # reason instead of getting the pod evicted.
               resources:
                 requests:
-                  cpu: "200m"
-                  memory: "512Mi"
+                  cpu: "100m"
+                  memory: "256Mi"
                 limits:
-                  cpu: "1"
-                  memory: "2Gi"
+                  cpu: "500m"
+                  memory: "1Gi"
               # Read-only root filesystem: MLflow stages the reference profile
-              # it downloads and the report it uploads through a temp dir, and
-              # keeps its client cache under $HOME.
+              # it downloads through a temp dir, and keeps its client cache
+              # under $HOME.
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp

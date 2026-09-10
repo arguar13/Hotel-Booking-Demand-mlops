@@ -6,12 +6,6 @@ env/
 # Claude Code's own local session/tool config - machine-local, not project source.
 .claude/
 
-# gitlab-ci-local: real AWS credentials for local train-smoke dry-runs.
-# Only the .example template is committed - see .gitlab-ci-local-variables.yml.example
-.gitlab-ci-local-variables.yml
-# gitlab-ci-local's own working/output directory (service logs, volumes state)
-.gitlab-ci-local/
-
 # Machine-local root CA override for Docker builds behind a TLS-intercepting
 # proxy/antivirus (see docker/local-ca-placeholder.crt and the Dockerfiles).
 # Never commit an actual CA here - only the empty placeholder is tracked.

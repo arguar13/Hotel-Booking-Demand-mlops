@@ -1,8 +1,6 @@
 import asyncio
-import json
 import logging
 import os
-import time
 from typing import Any
 
 # MLflow's own HTTP client already retries with backoff (default 5
@@ -21,8 +19,6 @@ import psycopg2
 import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Response, status
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
 from mlflow.tracking import MlflowClient
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -82,32 +78,6 @@ MODEL_RETRY_SECONDS = float(os.getenv("MODEL_RETRY_SECONDS", "15"))
 # How often to re-read the alias once a model *is* loaded, to pick up a newly
 # promoted version without a pod restart. 0 disables that (load once and stop).
 MODEL_REFRESH_SECONDS = float(os.getenv("MODEL_REFRESH_SECONDS", "0"))
-
-# Publishing prediction events to Kafka is entirely optional: it is only
-# attempted when KAFKA_BOOTSTRAP_SERVERS is set, and a Kafka outage must
-# never take down model serving. This feeds
-# core_ml/src/monitoring/stream_consumer.py's near-real-time drift
-# early-warning - see that module's docstring for why it exists alongside
-# the batch CronJob rather than instead of it.
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
-KAFKA_PREDICTIONS_TOPIC = os.getenv("KAFKA_PREDICTIONS_TOPIC", "predictions")
-# PLAINTEXT locally (docker-compose's single-broker dev Kafka has no TLS
-# listener); the production overlay sets this to "SSL" alongside
-# KAFKA_BOOTSTRAP_SERVERS once terraform/msk.tf is applied - that cluster's
-# encryption_in_transit.client_broker = "TLS" does not expose a plaintext
-# listener at all, so connecting without this would hang until
-# request_timeout_ms and never publish a single event.
-KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
-_kafka_producer: KafkaProducer | None = None
-
-# Once 5 consecutive publishes fail, stop even trying for 30s: without this,
-# a downed Kafka broker would make every single /predict request pay a full
-# connection-timeout on the publish call - a slow-motion, self-inflicted
-# outage of the *serving* path caused by a dependency that isn't even on
-# the critical path. This is the bounded-failure mechanism the "no infinite
-# retry loops" requirement calls for, applied to the one place in this
-# service that talks to an external system on every request.
-_kafka_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
 
 
 @retry(
@@ -217,43 +187,13 @@ async def _model_loader_loop() -> None:
 
 
 @app.on_event("startup")
-def load_kafka_producer():
-    """
-    Connects the optional prediction-event producer. Never raises: if Kafka
-    isn't configured or isn't reachable, `_kafka_producer` stays None and
-    /predict simply skips publishing, logging a warning instead of failing.
-    """
-    global _kafka_producer
-
-    if not KAFKA_BOOTSTRAP_SERVERS:
-        log.info("kafka_producer_disabled", reason="KAFKA_BOOTSTRAP_SERVERS not set")
-        return
-
-    try:
-        _kafka_producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            security_protocol=KAFKA_SECURITY_PROTOCOL,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            request_timeout_ms=5000,
-        )
-        log.info("kafka_producer_connected", bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
-    except KafkaError as e:
-        log.warning(
-            "kafka_producer_connect_failed",
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            error=str(e),
-        )
-
-
-@app.on_event("startup")
 async def start_inference_logger() -> None:
     """Open the prediction-log sink and start draining its queue.
 
-    Unlike the Kafka producer above, this one runs in production: it needs no
-    broker, only the RDS instance and credentials this pod already has. It is
-    what makes the drift monitor possible, and it is the reason a prediction
-    served in the cluster is now a durable, joinable record instead of a log
-    line on stdout.
+    Needs no broker, only the RDS instance and credentials this pod already
+    has. It is what makes the drift check possible, and it is the reason a
+    prediction served in the cluster is a durable, joinable record instead of
+    a log line on stdout.
     """
     await asyncio.to_thread(inference_logger.start)
     if inference_logger.enabled:
@@ -301,12 +241,10 @@ def health():
         "model_loaded": model is not None,
         "model_alias": MODEL_ALIAS,
         "model_version": model_version,
-        "kafka_circuit_breaker_state": _kafka_breaker.current_state,
-        # Surfaced here for the same reason as the Kafka breaker: the prediction
-        # sink failing is a partial degradation that must not fail readiness,
-        # but it silently starves the drift monitor of data. `rows_dropped`
-        # climbing is the signal that a drift report is about to be computed on
-        # a sample that no longer represents production traffic.
+        # A degraded prediction sink must not fail readiness, but it silently
+        # starves the drift check of data. `rows_dropped` climbing is the
+        # signal that the next drift check will run on an unrepresentative
+        # sample.
         "inference_logging": inference_logger.stats(),
     }
 
@@ -365,7 +303,7 @@ def predict_segment(features: BookingFeatures):
 
     The response carries a `prediction_id`: quote it back on POST /feedback once
     the booking's true segment is known, and this prediction becomes part of the
-    labelled sample the drift monitor measures concept drift on.
+    logged sample the drift check reads.
     """
     estimator = model
     if estimator is None:
@@ -389,8 +327,8 @@ def predict_segment(features: BookingFeatures):
         model_version=model_version,
     )
 
-    # Both sinks are non-blocking and non-fatal by construction: the durable
-    # one (Postgres) is an enqueue, the optional one (Kafka) is breaker-guarded.
+    # Non-blocking and non-fatal by construction: this is an in-memory
+    # enqueue, flushed to Postgres in the background (see monitoring.py).
     inference_logger.record_prediction(
         prediction_id=prediction_id,
         model_name=MODEL_NAME,
@@ -400,12 +338,6 @@ def predict_segment(features: BookingFeatures):
         confidence=confidence,
         margin=margin,
         features=jsonable_features(feature_map),
-    )
-    _publish_prediction_event(
-        features,
-        predicted_segment,
-        prediction_id=prediction_id,
-        confidence=confidence,
     )
 
     return PredictionResponse(
@@ -477,38 +409,3 @@ async def ingest_labels(labels: list[LabelIngest]):
     else:
         log.info("label_ingest_succeeded", accepted=accepted)
     return LabelIngestResponse(accepted=accepted, skipped=skipped)
-
-
-def _publish_prediction_event(
-    features: BookingFeatures,
-    predicted_segment: str,
-    prediction_id: str | None = None,
-    confidence: float | None = None,
-) -> None:
-    """Best-effort publish; Kafka being down must never fail the HTTP response.
-
-    Retained as an *optional* side channel for consumers that want predictions
-    as a stream (it is wired up in docker-compose, not in the cluster). The
-    durable record the drift monitor actually reads is the Postgres write above -
-    see monitoring.py for why a broker is not the right dependency for this
-    volume.
-    """
-    if _kafka_producer is None:
-        return
-
-    event = {
-        "timestamp": time.time(),
-        "prediction_id": prediction_id,
-        "model_name": MODEL_NAME,
-        "model_alias": MODEL_ALIAS,
-        "model_version": model_version,
-        "features": features.model_dump(),
-        "predicted_market_segment": predicted_segment,
-        "confidence": confidence,
-    }
-    try:
-        _kafka_breaker.call(_kafka_producer.send, KAFKA_PREDICTIONS_TOPIC, event)
-    except pybreaker.CircuitBreakerError:
-        log.warning("kafka_publish_skipped", reason="circuit breaker open")
-    except KafkaError as e:
-        log.warning("kafka_publish_failed", error=str(e))

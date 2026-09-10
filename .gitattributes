@@ -6,10 +6,8 @@
 # This is not cosmetic. With CRLF:
 #   - localstack-init/init-aws.sh breaks inside the container ("bad
 #     interpreter": the shebang line ends in \r),
-#   - yamllint's new-lines rule fails every YAML file, so `make ci` cannot pass
-#     on a Windows checkout even though it passes in CI,
-#   - the pre-commit mixed-line-ending hook rewrites files on every commit,
-#     producing a diff that never converges.
+#   - the pre-commit trailing-whitespace/end-of-file-fixer hooks rewrite
+#     files on every commit, producing a diff that never converges.
 * text=auto eol=lf
 
 # Binary formats: never touch these.

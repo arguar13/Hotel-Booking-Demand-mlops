@@ -2,29 +2,27 @@ locals {
   ecr_repositories = {
     api       = "${var.project_name}-api"
     dashboard = "${var.project_name}-dashboard"
-    # Ships boto3/psycopg2 baked in (Dockerfile.mlflow) - the same image
-    # docker-compose.yml uses locally, promoted unchanged to production.
-    mlflow = "${var.project_name}-mlflow"
     # Batch workloads: core_ml's code packaged to run inside the cluster
-    # (Dockerfile.jobs). The drift-monitor CronJob runs from it today; a
-    # scheduled retrain would reuse the same image with a different command.
-    # Until this image existed, none of the three carried the ML code at all,
-    # so nothing on the training/monitoring side could run outside a laptop.
+    # (Dockerfile.jobs) - the drift-check CronJob and manual training/promotion
+    # runs all use it, with a different `command:`.
     jobs = "${var.project_name}-jobs"
+    # MLflow itself is NOT built here: kubernetes/base/mlflow.yaml runs the
+    # official ghcr.io/mlflow/mlflow image directly, so there is no image for
+    # this project's own CI to build or push for it.
   }
 }
 
 resource "aws_ecr_repository" "this" {
   for_each = local.ecr_repositories
   name     = each.value
-  # Ver la entrada AWS-0031 en .trivyignore para por que los tags son mutables.
+  # Tags mutables: permite volver a publicar ":latest". En un entorno real,
+  # IMMUTABLE evita sobrescribir un tag ya desplegado por error.
   image_tag_mutability = "MUTABLE"
   force_delete         = true
 
-  # Escaneo de vulnerabilidades en cada push. Cierra el circulo con el job
-  # trivy-scan de CI: aquel analiza el codigo y los lockfiles antes de
-  # construir; esto analiza la imagen ya construida, incluidos los paquetes
-  # del sistema operativo base que el lockfile no cubre.
+  # Escaneo basico de vulnerabilidades en cada push (gratis, integrado en
+  # ECR) - no reemplaza un scanner dedicado, pero es mejor que nada sin
+  # agregar una herramienta mas al pipeline.
   image_scanning_configuration {
     scan_on_push = true
   }
@@ -52,5 +50,5 @@ resource "aws_ecr_lifecycle_policy" "this" {
 
 output "ecr_repository_urls" {
   value       = { for k, v in aws_ecr_repository.this : k => v.repository_url }
-  description = "URLs de los repositorios ECR (api, dashboard, mlflow, jobs)"
+  description = "URLs de los repositorios ECR (api, dashboard, jobs)"
 }

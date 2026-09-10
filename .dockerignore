@@ -21,5 +21,4 @@ docker-compose.yml
 # build context.
 core_ml/data/
 core_ml/.dvc/
-integration-tests/
 *.egg-info/

@@ -6,7 +6,6 @@ from pathlib import Path
 
 import mlflow
 import mlflow.sklearn
-import numpy as np
 import optuna
 import pandas as pd
 import structlog
@@ -23,7 +22,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from src.config_loader import load_config
 from src.data_contracts import validate_processed
 from src.data_processing import use_toy_data
-from src.monitoring.profile import PerformanceBaseline, build_reference_profile
+from src.monitoring.drift_check import PerformanceBaseline, build_reference_profile
 from src.traceability import collect_traceability_tags
 
 # MLflow >=3 prints run/model links decorated with emoji. A Windows console
@@ -51,26 +50,6 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 log = structlog.get_logger("hotel_mlops.train")
-
-
-def _confidence_signals(pipeline, features: pd.DataFrame) -> tuple[float | None, float | None]:
-    """Mean top-class probability and mean top-two margin on the held-out split.
-
-    These become the baseline the drift monitor compares live confidence
-    against - the unsupervised early-warning signal it relies on while a window
-    is still waiting for ground truth. Measured here, on data the model has not
-    seen, because an in-sample figure would be optimistically high and would
-    make ordinary production traffic read as a confidence collapse.
-    """
-    predict_proba = getattr(pipeline, "predict_proba", None)
-    if predict_proba is None:
-        return None, None
-    probabilities = predict_proba(features)
-    if probabilities.ndim != 2 or probabilities.shape[1] < 2:
-        return None, None
-    ordered = np.sort(probabilities, axis=1)
-    top, runner_up = ordered[:, -1], ordered[:, -2]
-    return float(np.mean(top)), float(np.mean(top - runner_up))
 
 
 class QualityGateError(Exception):
@@ -257,25 +236,21 @@ def train_pipeline() -> str:
         # --- Monitoring baseline -------------------------------------------
         # Drift is a comparison, so a model is only monitorable if the
         # distribution it was fitted on travels with it. This writes that
-        # baseline - feature histograms, the target mix, and the held-out
-        # performance and confidence figures - as an artifact of this run, which
-        # makes it immutable and reachable from the model version alone. The
-        # drift CronJob reads it back through the registry alias and never needs
-        # the training dataset, DVC, or bucket credentials to do its job.
+        # baseline - mean/std per numeric feature, plus the held-out
+        # performance - as an artifact of this run, which makes it immutable
+        # and reachable from the model version alone. The drift check
+        # (src/monitoring/drift_check.py) reads it back through the registry
+        # alias and never needs the training dataset, DVC, or bucket
+        # credentials to do its job.
         #
-        # Built from X_fit/y_fit (train+val), not the full frame: the reference
-        # for "what did this model learn from" is exactly the rows it was
-        # fitted on, which is train+val now that val has been folded back in.
-        mean_confidence, mean_margin = _confidence_signals(final_pipeline, X_test)
+        # Built from X_fit (train+val), not the full frame: the reference for
+        # "what did this model learn from" is exactly the rows it was fitted
+        # on, which is train+val now that val has been folded back in.
         reference_profile = build_reference_profile(
             features=X_fit,
-            target=y_fit,
-            target_column=config["model"]["target_column"],
             performance=PerformanceBaseline(
                 f1_weighted=float(f1),
                 accuracy=float(acc),
-                mean_confidence=mean_confidence,
-                mean_margin=mean_margin,
                 n_eval=int(len(y_test)),
             ),
         )
@@ -286,9 +261,7 @@ def train_pipeline() -> str:
         log.info(
             "reference_profile_logged",
             numeric_features=len(reference_profile.numeric),
-            categorical_features=len(reference_profile.categorical),
             baseline_f1=float(f1),
-            baseline_mean_confidence=mean_confidence,
         )
 
         # Log the model as an immutable, versioned MLflow Registry entry -
@@ -343,7 +316,7 @@ if __name__ == "__main__":
     # structlog is configured above to print JSON lines to this same stdout
     # (PrintLoggerFactory), so the run id cannot just be `print()`-ed without
     # a caller having to pick it out of a log stream. A file is what lets
-    # .gitlab-ci.yml's auto-retrain job (kicked off by mitigation.py) chain
+    # `make promote` (and .gitlab-ci.yml's manual `train` stage) chain
     # straight into `python -m src.promote_model --run-id $(cat run_id.txt)`
     # without parsing logs.
     Path("run_id.txt").write_text(completed_run_id, encoding="utf-8")

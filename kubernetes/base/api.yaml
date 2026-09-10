@@ -26,9 +26,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: api
-          # Tag set per-overlay via `kustomize edit set image` (CI writes
-          # the freshly-built $IMAGE_TAG here, then commits - see
-          # .gitlab-ci.yml's gitops-release job).
+          # Tag set per-overlay via `kustomize edit set image` (CI's
+          # `deploy` job writes the freshly-built $IMAGE_TAG here, then
+          # runs `kubectl apply -k` - see .gitlab-ci.yml).
           image: hotel-mlops-api:local
           imagePullPolicy: Always
           securityContext:

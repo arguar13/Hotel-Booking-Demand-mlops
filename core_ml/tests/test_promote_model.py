@@ -20,7 +20,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 from sklearn.dummy import DummyClassifier
 
-from src.monitoring.profile import PerformanceBaseline, ReferenceProfile
+from src.monitoring.drift_check import PerformanceBaseline, ReferenceProfile
 from src.promote_model import PromotionError, promote, rollback
 
 REGISTRY_NAME = "PromoteTestClassifier"
@@ -60,13 +60,9 @@ def _log_candidate_run(config: dict, f1_weighted: float, quality_gate: str = "pa
         profile = ReferenceProfile(
             created_at="2026-01-01T00:00:00+00:00",
             n_rows=100,
-            target_column="market_segment",
-            n_bins=10,
             performance=PerformanceBaseline(
                 f1_weighted=f1_weighted,
                 accuracy=f1_weighted,
-                mean_confidence=0.9,
-                mean_margin=0.5,
                 n_eval=100,
             ),
         )

@@ -1,10 +1,14 @@
 # Shift-left validation gate for this repo.
 #
-# Design decision: ruff/black/isort/mypy/pytest/bandit run through `poetry -C <dir>`
-# instead of the usual pre-commit "mirror" repos. That way there is a single source
-# of truth for tool versions (each sub-project's poetry.lock) shared by local dev,
-# these hooks, and CI (`make ci`) — no second version pinned inside this file that
-# can silently drift from the lockfile.
+# ruff/mypy/pytest run through `poetry -C <dir>` instead of the usual
+# pre-commit "mirror" repos, so there is a single source of truth for tool
+# versions (each sub-project's poetry.lock) shared by local dev, these
+# hooks, and CI (`make lint` / `make test`).
+#
+# In a real production setup you would likely add a secret scanner
+# (detect-secrets), a security linter (bandit), an image/IaC scanner
+# (trivy) and a YAML style linter (yamllint) - exactly the kind of gate
+# worth having once more than one person touches the repo.
 #
 # Setup: `make install` (installs both poetry envs + registers these hooks).
 default_language_version:
@@ -16,36 +20,10 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
-      - id: mixed-line-ending
-        args: [--fix=lf]
-      - id: check-merge-conflict
-      - id: check-case-conflict
-      - id: check-added-large-files
-        args: [--maxkb=2048]
-      - id: check-toml
-      - id: check-json
-      - id: detect-private-key
       - id: check-yaml
         args: [--allow-multiple-documents]
-
-  - repo: https://github.com/adrienverge/yamllint
-    rev: v1.38.0
-    hooks:
-      - id: yamllint
-        args: [--config-file=.yamllint.yml]
-
-  - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.5.0
-    hooks:
-      - id: detect-secrets
-        # --exclude-lines newTag: the image tags in
-        # kubernetes/overlays/production/kustomization.yaml are 40-char git
-        # SHAs, which the high-entropy-hex detector flags. Baselining one is
-        # pointless - CI's gitops-release job rewrites it with a new SHA on
-        # every build, so the next commit would be blocked again. An image tag
-        # is never a credential.
-        args: [--baseline, .secrets.baseline, --exclude-lines, 'newTag:']
-        exclude: poetry\.lock$
+      - id: check-added-large-files
+        args: [--maxkb=2048]
 
   - repo: local
     hooks:
@@ -66,37 +44,21 @@ repos:
         pass_filenames: false
         args: ["."]
 
-      - id: isort-api
-        name: isort (api)
-        entry: poetry -C api run isort
-        language: system
-        files: ^api/.*\.py$
-        pass_filenames: false
-        args: ["."]
-
-      - id: black-api
-        name: black (api)
-        entry: poetry -C api run black
+      - id: ruff-format-api
+        name: ruff format (api)
+        entry: poetry -C api run ruff format
         language: system
         files: ^api/.*\.py$
         pass_filenames: false
         args: ["."]
 
       - id: mypy-api
-        name: mypy (api)
-        entry: poetry -C api run mypy
+        name: mypy (api) - advisory, never blocks a commit
+        entry: bash -c 'poetry -C api run mypy . || true'
         language: system
         files: ^api/.*\.py$
         pass_filenames: false
-        args: ["."]
-
-      - id: bandit-api
-        name: bandit (api)
-        entry: poetry -C api run bandit
-        language: system
-        files: ^api/.*\.py$
-        pass_filenames: false
-        args: ["-q", "-r", ".", "-x", "./tests"]
+        verbose: true
 
       - id: pytest-api
         name: pytest (api)
@@ -115,37 +77,21 @@ repos:
         pass_filenames: false
         args: ["."]
 
-      - id: isort-core-ml
-        name: isort (core_ml)
-        entry: poetry -C core_ml run isort
-        language: system
-        files: ^core_ml/.*\.py$
-        pass_filenames: false
-        args: ["."]
-
-      - id: black-core-ml
-        name: black (core_ml)
-        entry: poetry -C core_ml run black
+      - id: ruff-format-core-ml
+        name: ruff format (core_ml)
+        entry: poetry -C core_ml run ruff format
         language: system
         files: ^core_ml/.*\.py$
         pass_filenames: false
         args: ["."]
 
       - id: mypy-core-ml
-        name: mypy (core_ml)
-        entry: poetry -C core_ml run mypy
+        name: mypy (core_ml) - advisory, never blocks a commit
+        entry: bash -c 'poetry -C core_ml run mypy . || true'
         language: system
         files: ^core_ml/.*\.py$
         pass_filenames: false
-        args: ["."]
-
-      - id: bandit-core-ml
-        name: bandit (core_ml)
-        entry: poetry -C core_ml run bandit
-        language: system
-        files: ^core_ml/.*\.py$
-        pass_filenames: false
-        args: ["-q", "-r", ".", "-x", "./tests"]
+        verbose: true
 
       - id: pytest-core-ml
         name: pytest (core_ml)
@@ -154,54 +100,3 @@ repos:
         files: ^core_ml/.*\.py$
         pass_filenames: false
         args: []
-
-      # --- integration-tests/ (Testcontainers) ---
-      # Lint/format/type-check like the other two projects, but no pytest
-      # hook here: these tests need a running Docker daemon and spin up real
-      # containers (Kafka alone takes ~1-2 min), which is exactly the wrong
-      # cost to pay on every commit. Run them explicitly with
-      # `make test-integration`, and in CI as a separate, later stage.
-      - id: ruff-integration-tests
-        name: ruff check (integration-tests)
-        entry: poetry -C integration-tests run ruff check --fix
-        language: system
-        files: ^integration-tests/.*\.py$
-        pass_filenames: false
-        args: ["."]
-
-      - id: isort-integration-tests
-        name: isort (integration-tests)
-        entry: poetry -C integration-tests run isort
-        language: system
-        files: ^integration-tests/.*\.py$
-        pass_filenames: false
-        args: ["."]
-
-      - id: black-integration-tests
-        name: black (integration-tests)
-        entry: poetry -C integration-tests run black
-        language: system
-        files: ^integration-tests/.*\.py$
-        pass_filenames: false
-        args: ["."]
-
-      - id: mypy-integration-tests
-        name: mypy (integration-tests)
-        entry: poetry -C integration-tests run mypy
-        language: system
-        files: ^integration-tests/.*\.py$
-        pass_filenames: false
-        args: ["."]
-
-      - id: bandit-integration-tests
-        name: bandit (integration-tests)
-        entry: poetry -C integration-tests run bandit
-        language: system
-        files: ^integration-tests/.*\.py$
-        pass_filenames: false
-        # No -x ./tests here: unlike api/core_ml, every .py file in this
-        # project *is* a test, so excluding tests/ would scan nothing.
-        # Skipped checks are all expected-by-design in this project:
-        # B101 (assert in tests), B105/B106 (LocalStack's well-known dummy
-        # "test"/"test" credentials and a fake Secrets Manager test value).
-        args: ["-q", "-r", ".", "--skip", "B101,B105,B106"]

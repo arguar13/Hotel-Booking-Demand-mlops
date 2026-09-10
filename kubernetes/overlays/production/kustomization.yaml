@@ -4,9 +4,6 @@ kind: Kustomization
 resources:
 - ../../base
 
-patches:
-- path: patch-service-account-arns.yaml
-
 # behavior: merge - overlays these values onto kubernetes/base/mlops-config.env
 # rather than replacing the whole ConfigMap, so base-only keys (DB_PORT,
 # MODEL_REGISTRY_ALIAS, ...) still come through.
@@ -20,20 +17,19 @@ configMapGenerator:
   name: mlops-config
   namespace: hotel-mlops
 
-# Updated on every successful build by .gitlab-ci.yml's gitops-release job
-# via `kustomize edit set image <name>=<registry>/<repo>:<tag>` - a
-# structural edit of this file, never a text-substitution/sed hack. The
-# values below are placeholders for the *first* deploy; after that, this
-# block is only ever touched by that CI command.
+# Updated on every successful build by .gitlab-ci.yml's `build_push` job via
+# `kustomize edit set image <name>=<registry>/<repo>:<tag>` - a structural
+# edit of this file, never a text-substitution/sed hack. The values below
+# are placeholders for the *first* deploy; after that, this block is only
+# ever touched by that CI command. mlflow is not listed here: it runs the
+# official ghcr.io/mlflow/mlflow image (see kubernetes/base/mlflow.yaml),
+# not an image this project builds.
 images:
 - name: hotel-mlops-api
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-api
   newTag: f55f653acfa7dd6a47619d8c29e84c2845f849cc
 - name: hotel-mlops-dashboard
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-dashboard
-  newTag: f55f653acfa7dd6a47619d8c29e84c2845f849cc
-- name: hotel-mlops-mlflow
-  newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-mlflow
   newTag: f55f653acfa7dd6a47619d8c29e84c2845f849cc
 - name: hotel-mlops-jobs
   newName: REDACTED_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hotel-mlops-jobs

@@ -1,4 +1,4 @@
-"""Production inference logging - the write half of the drift-monitoring loop.
+"""Production inference logging - the write half of the drift-check loop.
 
 Every prediction this service answers is persisted, with a stable correlation
 id, to `monitoring.predictions` in the same RDS instance MLflow already uses.
@@ -6,20 +6,13 @@ A separate, far lower-volume path records the ground-truth segment once a
 booking is reconciled against its channel of record
 (`monitoring.booking_labels`).
 
-Those two tables are the entire contract between this service and the drift
-monitor that runs as a Kubernetes CronJob (`core_ml/src/monitoring/`):
-
-    data drift        reads `features`
-    prediction drift  reads `predicted_segment`
-    confidence drift  reads `confidence` / `margin`
-    CONCEPT drift     reads the join of both tables on `prediction_id`
-
-Concept drift - a change in P(y|X) - is the only one of the four that cannot
-be computed from the serving side alone, which is exactly why `prediction_id`
-is minted here, returned to the caller, and used as the join key later. A
-prediction log without a correlation id can never be reconciled with ground
-truth, and a monitor without ground truth can only ever report on the model's
-*inputs*, never on whether the model is still right.
+`monitoring.predictions` (specifically its `features` column) is what
+`core_ml/src/monitoring/drift_check.py` reads on a schedule to compare a
+recent batch of traffic against the training-time reference profile.
+`monitoring.booking_labels` is not read by that check today - it exists so a
+future, more thorough check (comparing live accuracy against a held-out
+baseline, not just feature means) has the ground truth to do that with,
+without needing a new endpoint or a schema change.
 
 Design constraints, in priority order:
 
@@ -27,32 +20,16 @@ Design constraints, in priority order:
    write must not add latency to /predict and must never turn a successful
    prediction into an HTTP error. Records go onto a bounded in-memory queue
    with a non-blocking put, are flushed in batches by a background task, and
-   every database call goes through a circuit breaker - the same mechanism
-   already proven around the Kafka publish in main.py.
+   every database call goes through a circuit breaker.
 2. **Bounded memory.** The queue has a hard cap. When it is full the oldest
    record is dropped and counted: shedding observability data under pressure
    is correct behaviour, growing unbounded until the kubelet OOM-kills the
    pod is not.
 3. **At-most-once, deliberately.** Losing a handful of rows on SIGTERM is
-   acceptable for a statistical monitor whose smallest decision window is
-   thousands of rows. Buying at-least-once (an outbox table, a WAL, a broker)
+   acceptable for a statistical check whose smallest decision window is
+   hundreds of rows. Buying at-least-once (an outbox table, a WAL, a broker)
    would put the serving path back into the dependency chain, which
    constraint 1 forbids.
-
-Why Postgres rather than the Kafka topic main.py also publishes to
-(terraform/msk.tf provisions the broker; core_ml/src/monitoring/stream_consumer.py
-is the other reader): this module's job is the durable, joinable record that
-concept drift's ground-truth reconciliation and every CronJob run depend on.
-At-most-once delivery to an unbounded queue (constraint 3 above) is the right
-trade for that job precisely because it is never the only copy - the row is
-also in Postgres. Kafka is not a substitute for that: the stream consumer
-holds no history and answers a different question (has the last few minutes
-of *inputs* moved) that does not need one. Standing up a broker to replace
-Postgres here - to move the audit trail itself onto Kafka - would still be
-the wrong call for the volume this project runs at; standing one up to feed
-a second, faster-reacting analysis alongside it is a different decision with
-a different justification, made explicitly in stream_consumer.py's own
-module docstring rather than silently overriding this one.
 """
 
 import logging
@@ -71,8 +48,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 log = structlog.get_logger("hotel_mlops.api.monitoring")
 
-# Fixed, not configurable: this schema name is also hardcoded in the drift
-# monitor's queries (core_ml/src/monitoring/store.py). Making it an env var
+# Fixed, not configurable: this schema name is also hardcoded in
+# core_ml/src/monitoring/drift_check.py's queries. Making it an env var
 # would let the two halves disagree at runtime with no way to detect it, and
 # would turn every statement below into dynamic SQL for no benefit.
 SCHEMA = "monitoring"
@@ -92,9 +69,6 @@ QUEUE_MAX_SIZE = int(os.getenv("MONITORING_QUEUE_MAX_SIZE", "10000"))
 # The DDL is idempotent and applied by the writer at startup. This project has
 # no migration tool, and introducing one for a two-table, append-only schema
 # with a single writer would be more moving parts than the problem has.
-# integration-tests/tests/test_monitoring_schema.py applies this exact constant
-# against a real Postgres container and then runs the monitor's own queries
-# against it, so the two halves cannot drift apart unnoticed.
 SCHEMA_DDL = f"""
 CREATE SCHEMA IF NOT EXISTS {SCHEMA};
 
@@ -222,9 +196,11 @@ class InferenceLogger:
         self._written = 0
         self._lock = threading.Lock()
         self._schema_ready = False
-        # Same bounded-failure posture as the Kafka breaker in main.py: after 5
-        # consecutive failures, stop calling a dependency that has already
-        # proven it is down and re-probe every 30s instead of on every flush.
+        # Bounded-failure posture: after 5 consecutive failures, stop calling a
+        # dependency that has already proven it is down and re-probe every 30s
+        # instead of on every flush. main.py surfaces the resulting
+        # CircuitBreakerError as a 503, so callers get a fast, honest failure
+        # instead of a hung request.
         self.breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=30)
 
     # -- lifecycle ---------------------------------------------------------

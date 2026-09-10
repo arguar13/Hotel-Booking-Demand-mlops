@@ -1,16 +1,12 @@
-# Lectura del secreto en Secrets Manager
-data "aws_secretsmanager_secret" "db_password" {
-  # Asegúrate de que este nombre coincida exactamente con el que pusiste en el Paso 1
-  name = "hotel-mlops/db-password"
-}
-
-data "aws_secretsmanager_secret_version" "db_password" {
-  secret_id = data.aws_secretsmanager_secret.db_password.id
-}
-
-# Inyección del secreto en un local
-locals {
-  db_password = jsondecode(data.aws_secretsmanager_secret_version.db_password.secret_string)["db_password"]
+# La contrasena se genera aca con `random_password` y el operador la copia a
+# mano a un Secret de Kubernetes plano (ver kubernetes/base/mlops-config.env
+# y el README, seccion "Desplegar"). Es menos automatico que materializar el
+# secreto desde AWS, pero evita mantener piezas de infraestructura extra
+# para un proyecto de este tamano. Con mas de un operador y rotacion de
+# credenciales, automatizar esa materializacion vuelve a valer la pena.
+resource "random_password" "db_password" {
+  length  = 24
+  special = false # facilita copiar/pegar el valor al crear el Secret de Kubernetes
 }
 
 resource "aws_db_instance" "mlflow_db" {
@@ -21,9 +17,12 @@ resource "aws_db_instance" "mlflow_db" {
   allocated_storage = 20
   db_name           = "postgres"
   username          = var.db_username
+  password          = random_password.db_password.result
 
-  # Usamos el local generado desde Secrets Manager en lugar de var.db_password
-  password = local.db_password
+  # Instancia unica, sin Multi-AZ ni replicas de lectura: para un proyecto
+  # de aprendizaje, la disponibilidad extra no justifica el costo ni la
+  # complejidad de operar un failover.
+  multi_az = false
 
   # Utiliza el subnet group creado en vpc.tf
   db_subnet_group_name   = module.vpc.database_subnet_group_name
@@ -45,5 +44,11 @@ resource "aws_db_instance" "mlflow_db" {
 
 output "rds_endpoint" {
   value       = aws_db_instance.mlflow_db.endpoint
-  description = "Endpoint de RDS para MLflow (Inyectar en ConfigMap K8s)"
+  description = "Endpoint de RDS para MLflow (usar en kubernetes/overlays/production/mlops-config.env)"
+}
+
+output "db_password" {
+  value       = random_password.db_password.result
+  description = "Contrasena generada para RDS. Copiala al crear el Secret de Kubernetes (ver README, seccion Desplegar): `terraform output -raw db_password`"
+  sensitive   = true
 }
