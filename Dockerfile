@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     POETRY_VERSION=2.4.1
 
 WORKDIR /app
-ENV PYTHONPATH="/app/api:${PYTHONPATH}"
+ENV PYTHONPATH="/app/api"
 
 # Optional local CA trust for machines where a corporate/AV proxy performs
 # TLS interception on outbound HTTPS (see README "Notas y solución de
