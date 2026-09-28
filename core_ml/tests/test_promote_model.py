@@ -54,6 +54,9 @@ def _log_candidate_run(config: dict, f1_weighted: float, quality_gate: str = "pa
             sk_model=model,
             name="model",
             registered_model_name=config["model"]["registry_name"],
+            # Explicit, so MLflow does not reload the model in a subprocess to
+            # infer them - that inference was ~30s of every test here.
+            pip_requirements=["scikit-learn"],
         )
         mlflow.set_tag("quality_gate", quality_gate)
 

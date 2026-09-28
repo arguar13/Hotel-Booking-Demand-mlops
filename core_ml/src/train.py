@@ -1,5 +1,6 @@
 import os
 import tempfile
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 import cloudpickle
@@ -29,6 +30,16 @@ from src.traceability import collect_traceability_tags
 cloudpickle.register_pickle_by_value(features_module)
 
 log = structlog.get_logger("hotel_mlops.train")
+
+# What it takes to unpickle and run the logged pipeline, pinned to the versions
+# that trained it. Declared rather than left to MLflow's inference, which
+# reloads the model in a subprocess to guess (~30s per run) and picks up
+# whatever else happens to be imported in the training process.
+MODEL_REQUIREMENTS = ("scikit-learn", "pandas", "numpy", "cloudpickle")
+
+
+def _model_requirements() -> list[str]:
+    return [f"{package}=={package_version(package)}" for package in MODEL_REQUIREMENTS]
 
 
 class QualityGateError(Exception):
@@ -237,6 +248,7 @@ def train_pipeline() -> str:
             name="model",
             registered_model_name=registry_name,
             serialization_format="cloudpickle",
+            pip_requirements=_model_requirements(),
         )
 
         run_id = run.info.run_id

@@ -9,6 +9,7 @@ and proves the pipeline's wiring - not the model's real-world accuracy.
 from pathlib import Path
 
 import mlflow
+import mlflow.pyfunc
 import numpy as np
 import pandas as pd
 import pytest
@@ -142,6 +143,12 @@ def test_train_pipeline_registers_a_promotion_candidate_when_quality_gate_passes
     feature_spec = mlflow.artifacts.load_dict(f"runs:/{run_id}/features/feature_spec.json")
     assert "distribution_channel" not in feature_spec["input_columns"]
     assert "reservation_status" not in feature_spec["input_columns"]
+
+    # Pinned, declared requirements - not whatever MLflow inferred.
+    requirements_file = mlflow.pyfunc.get_model_dependencies(f"models:/{registry_name}/1")
+    requirements = Path(requirements_file).read_text(encoding="utf-8")
+    assert "scikit-learn==" in requirements
+    assert "imbalanced-learn" not in requirements
 
     with pytest.raises(MlflowException):
         client.get_model_version_by_alias(registry_name, registry_alias)
