@@ -226,10 +226,11 @@ def loaded_model(monkeypatch):
     return model
 
 
+# Only the required fields of BookingFeatures; the rest take their defaults.
 PAYLOAD = {
     "hotel": "Resort Hotel",
     "lead_time": 10,
-    "arrival_date_year": 2017,
+    "month": 7,
     "arrival_date_week_number": 27,
     "arrival_date_day_of_month": 1,
     "stays_in_weekend_nights": 0,
@@ -237,13 +238,10 @@ PAYLOAD = {
     "adults": 2,
     "meal": "BB",
     "country": "PRT",
-    "distribution_channel": "Direct",
     "reserved_room_type": "A",
-    "assigned_room_type": "A",
     "deposit_type": "No Deposit",
     "customer_type": "Transient",
     "adr": 98.0,
-    "month": 7,
 }
 
 

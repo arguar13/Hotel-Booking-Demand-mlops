@@ -435,7 +435,7 @@ def jsonable_features(features: dict[str, Any]) -> dict[str, Any]:
     return {k: _clean(v) for k, v in features.items()}
 
 
-# Module-level singleton, wired up by main.py's startup/shutdown hooks.
+# Module-level singleton, started and closed by main.py's lifespan handler.
 inference_logger = InferenceLogger()
 
 logging.getLogger("psycopg2").setLevel(logging.WARNING)
