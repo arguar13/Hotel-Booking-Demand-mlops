@@ -84,10 +84,14 @@ model:
   test_size: 0.2
   validation_size: 0.2
   random_state: 42
-  # Each trial fits a RandomForest on ~50k rows (roughly a minute on a
-  # laptop). Raise it for a real tuning run; the sampler is seeded with
-  # random_state, so the same value always explores the same trials.
-  n_trials_optuna: 5
+  # Each trial fits a RandomForest on ~50k rows (tens of seconds on a laptop).
+  # Trial 0 is always scikit-learn's default RandomForest, so the tuned model
+  # can never be worse than the untuned one on validation. The sampler is
+  # seeded with random_state, so the same value explores the same trials.
+  n_trials_optuna: 8
+  # Also refit on every arrival year but the last and score the last one,
+  # logged as temporal_f1_score / temporal_f1_macro - see train.py.
+  temporal_backtest: true
   # Quality gate: a trained model version is only ever a promotion
   # *candidate* when its weighted F1 on the held-out test split meets this
   # bar. A run that misses it is still logged to MLflow for audit, but the

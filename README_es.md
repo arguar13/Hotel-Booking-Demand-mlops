@@ -228,15 +228,40 @@ calculan dentro del pipeline de scikit-learn registrado, así que la API envía
 los campos crudos de la reserva y no puede divergir del entrenamiento.
 
 El desbalance de clases se corrige solo con
-`class_weight="balanced_subsample"`. Se quitó SMOTE: interpolaba entre filas
-one-hot (países fraccionarios), hacía cada trial más lento y, combinado con
-pesos por clase, corregía el desbalance dos veces.
+`class_weight="balanced_subsample"`, sin remuestreo: los métodos de
+sobremuestreo como SMOTE interpolan entre filas codificadas one-hot (generando
+categorías fraccionarias) y, combinados con pesos por clase, corregirían el
+desbalance dos veces.
 
-Con las columnas con fuga, un RandomForest llegaba a ~0,93 de F1 ponderado,
-en buena parte por buscar `distribution_channel`/`agent`. Solo con features
-disponibles al reservar, el entrenamiento sobre el dataset completo obtiene
-**F1 ponderado ~0,81 y F1 macro ~0,74** en el split de test reservado. Esa
-cifra más baja es la honesta.
+## Cómo se evalúa el modelo
+
+- **Split estratificado en tres partes (60/20/20).** Optuna puntúa a los
+  candidatos solo con validación; el split de test se usa una única vez,
+  para las cifras finales.
+- **El modelo sin tunear siempre compite.** El trial 0 es el RandomForest por
+  defecto de scikit-learn, así que el tuning solo puede reemplazarlo por una
+  configuración que puntúe mejor en validación (`val_f1_default` vs
+  `val_f1_best`).
+- **Cada run lleva su línea base ingenua.** Predecir siempre el segmento más
+  frecuente da 0,59 de accuracy pero 0,106 de F1 macro: por eso la accuracy
+  no es la métrica principal (`baseline_f1_*`).
+- **F1 ponderado y macro**, reporte por clase, matriz de confusión y ROC AUC
+  uno-contra-resto por segmento se registran en MLflow en cada run.
+- **Backtest temporal.** La configuración elegida se reentrena con 2015-2016 y
+  se evalúa en 2017 (`temporal_f1_*`): la estimación para reservas que el
+  modelo nunca vio, con la mezcla de canales ya desplazada.
+
+Entrenamiento sobre el dataset completo (`n_trials_optuna: 8`):
+
+| | F1 ponderado | F1 macro |
+|---|---|---|
+| Línea base (clase más frecuente, test) | 0,439 | 0,106 |
+| Validación: default -> tuneado | 0,844 -> 0,855 | - |
+| **Split de test (aleatorio, estratificado)** | **0,866** | **0,834** |
+| **2017, entrenado con 2015-2016** | **0,765** | **0,617** |
+
+La diferencia entre las dos últimas filas es la razón de ser del chequeo de
+drift que sigue.
 
 ## Promover un modelo a campeón
 

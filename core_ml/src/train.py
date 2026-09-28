@@ -2,6 +2,7 @@ import os
 import tempfile
 from importlib.metadata import version as package_version
 from pathlib import Path
+from typing import Any
 
 import cloudpickle
 import mlflow
@@ -10,7 +11,14 @@ import optuna
 import pandas as pd
 import structlog
 from mlflow.tracking import MlflowClient
-from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 
 from src import features as features_module
@@ -40,6 +48,62 @@ MODEL_REQUIREMENTS = ("scikit-learn", "pandas", "numpy", "cloudpickle")
 
 def _model_requirements() -> list[str]:
     return [f"{package}=={package_version(package)}" for package in MODEL_REQUIREMENTS]
+
+
+# scikit-learn's own RandomForest defaults (unlimited depth, one-sample
+# leaves). Enqueued as the first Optuna trial - see train_pipeline().
+DEFAULT_PARAMS: dict[str, Any] = {
+    "n_estimators": 100,
+    "max_depth": None,
+    "min_samples_leaf": 1,
+    "max_features": "sqrt",
+}
+
+
+def suggest_params(trial: optuna.Trial) -> dict[str, Any]:
+    """The hyperparameter search space; it contains DEFAULT_PARAMS.
+
+    Unlimited depth stays a candidate: on ~50k bookings with class weights,
+    fully grown trees are a strong configuration, and a space that only
+    offers shallow ones can make tuning *worse* than not tuning.
+    """
+    return {
+        "n_estimators": trial.suggest_int("n_estimators", 100, 300, step=50),
+        "max_depth": trial.suggest_categorical("max_depth", [None, 20, 30, 40]),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 4),
+        "max_features": trial.suggest_categorical("max_features", ["sqrt", 0.5]),
+    }
+
+
+def temporal_backtest(
+    df: pd.DataFrame,
+    spec: FeatureSpec,
+    params: dict[str, Any],
+    random_state: int,
+    target_column: str,
+) -> dict[str, Any] | None:
+    """Fit on every arrival year but the last, score the last one.
+
+    Returns None when the data covers a single year (nothing to hold out).
+    """
+    years = sorted(int(year) for year in df["arrival_date_year"].dropna().unique())
+    if len(years) < 2:
+        return None
+    holdout_year = years[-1]
+    past = df[df["arrival_date_year"] < holdout_year]
+    future = df[df["arrival_date_year"] == holdout_year]
+
+    pipeline = build_model_pipeline(spec, params, random_state)
+    pipeline.fit(past[spec.input_columns], past[target_column])
+    predicted = pipeline.predict(future[spec.input_columns])
+    return {
+        "train_years": [year for year in years if year < holdout_year],
+        "holdout_year": holdout_year,
+        "n_train": int(len(past)),
+        "n_test": int(len(future)),
+        "f1_weighted": float(f1_score(future[target_column], predicted, average="weighted")),
+        "f1_macro": float(f1_score(future[target_column], predicted, average="macro")),
+    }
 
 
 class QualityGateError(Exception):
@@ -143,12 +207,7 @@ def train_pipeline() -> str:
     )
 
     def objective(trial: optuna.Trial) -> float:
-        params = {
-            "n_estimators": trial.suggest_int("n_estimators", 50, 200),
-            "max_depth": trial.suggest_int("max_depth", 8, 25),
-            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 5),
-        }
-        pipeline = build_model_pipeline(spec, params, random_state)
+        pipeline = build_model_pipeline(spec, suggest_params(trial), random_state)
         pipeline.fit(X_train, y_train)
         return float(f1_score(y_val, pipeline.predict(X_val), average="weighted"))
 
@@ -158,14 +217,26 @@ def train_pipeline() -> str:
     study = optuna.create_study(
         direction="maximize", sampler=optuna.samplers.TPESampler(seed=random_state)
     )
+    # The untuned configuration is always trial 0, so tuning can only ever
+    # replace it with something that scores better on validation - never
+    # ship a "tuned" model that is worse than the defaults it started from.
+    study.enqueue_trial(DEFAULT_PARAMS)
     study.optimize(objective, n_trials=config["model"]["n_trials_optuna"])
 
     best_params = study.best_params
-    log.info("optuna_tuning_finished", best_params=best_params)
+    default_val_f1 = float(study.trials[0].value or 0.0)
+    log.info(
+        "optuna_tuning_finished",
+        best_params=best_params,
+        best_val_f1=study.best_value,
+        default_val_f1=default_val_f1,
+    )
 
     # Final Model Training with MLflow logging
     with mlflow.start_run(run_name="Best_RandomForest_Model") as run:
         mlflow.log_params(best_params)
+        mlflow.log_metric("val_f1_best", float(study.best_value))
+        mlflow.log_metric("val_f1_default", default_val_f1)
         mlflow.set_tags(collect_traceability_tags(processed_path))
         mlflow.set_tag("used_toy_data", str(use_toy_data()))
         mlflow.log_dict(
@@ -205,6 +276,48 @@ def train_pipeline() -> str:
             classification_report(y_test, y_pred, output_dict=True, zero_division=0),
             "evaluation/classification_report.json",
         )
+        labels = [str(label) for label in final_pipeline.classes_]
+        # Threshold-free view per segment: a class with high ROC AUC but low
+        # recall is ranked well and only loses at the argmax decision - a
+        # thresholding problem, not a feature problem.
+        probabilities = final_pipeline.predict_proba(X_test)
+        roc_auc = {
+            label: float(roc_auc_score((y_test == label).astype(int), probabilities[:, i]))
+            for i, label in enumerate(labels)
+        }
+        mlflow.log_dict(roc_auc, "evaluation/roc_auc_ovr.json")
+        mlflow.log_metric("roc_auc_ovr_macro", float(sum(roc_auc.values()) / len(roc_auc)))
+        mlflow.log_dict(
+            {
+                "labels": labels,
+                "rows": "true class",
+                "columns": "predicted class",
+                "matrix": confusion_matrix(y_test, y_pred, labels=labels).tolist(),
+            },
+            "evaluation/confusion_matrix.json",
+        )
+
+        # A floor to read every other number against: always predicting the
+        # most frequent segment already gets ~59% accuracy on this data, which
+        # is why accuracy alone says little here. Scored on the same test split.
+        naive = DummyClassifier(strategy="most_frequent").fit(X_fit, y_fit)
+        naive_pred = naive.predict(X_test)
+        mlflow.log_metric("baseline_f1_score", f1_score(y_test, naive_pred, average="weighted"))
+        mlflow.log_metric("baseline_f1_macro", f1_score(y_test, naive_pred, average="macro"))
+
+        # The random split above estimates performance on bookings like the
+        # ones trained on. Production only ever sees *later* bookings, so this
+        # also refits on every year but the last and scores the last one - the
+        # number to expect once the booking mix has moved on.
+        if config["model"].get("temporal_backtest", True):
+            backtest = temporal_backtest(
+                df, spec, best_params, random_state, config["model"]["target_column"]
+            )
+            if backtest is not None:
+                mlflow.log_metric("temporal_f1_score", backtest["f1_weighted"])
+                mlflow.log_metric("temporal_f1_macro", backtest["f1_macro"])
+                mlflow.log_dict(backtest, "evaluation/temporal_backtest.json")
+                log.info("temporal_backtest_logged", **backtest)
 
         # --- Monitoring baseline -------------------------------------------
         # Drift is a comparison, so a model is only monitorable if the

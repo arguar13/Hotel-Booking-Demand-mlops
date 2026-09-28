@@ -77,3 +77,6 @@ GUIA_EJECUCION_PROYECTO*.docx
 
 # Office/Word lock files - created whenever a .docx in the repo is open
 ~$*
+
+# Portfolio blog drafts, images and cover - published to WordPress, not part of the project.
+blog/

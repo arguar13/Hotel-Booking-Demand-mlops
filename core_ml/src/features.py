@@ -151,9 +151,9 @@ def build_model_pipeline(spec: FeatureSpec, params: dict[str, Any], random_state
     """Preprocessing + a class-weighted RandomForest.
 
     Class imbalance is handled with `class_weight="balanced_subsample"` and
-    nothing else. SMOTE was dropped: it interpolated between one-hot rows
-    (producing "0.4 of a country"), slowed every trial down, and stacking it
-    with class weights would correct the imbalance twice.
+    nothing else - no resampling. Oversampling such as SMOTE interpolates
+    between one-hot rows (producing "0.4 of a country"), slows every trial
+    down, and stacked with class weights would correct the imbalance twice.
     """
     classifier = RandomForestClassifier(
         **params,

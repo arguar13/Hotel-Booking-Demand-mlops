@@ -18,7 +18,8 @@ from mlflow.tracking import MlflowClient
 
 from src import train as train_module
 from src.config_loader import load_config
-from src.train import QualityGateError, train_pipeline
+from src.features import FeatureSpec
+from src.train import QualityGateError, temporal_backtest, train_pipeline
 
 N_PER_CLASS = 20
 CLASS_LEAD_TIME_OFFSETS = {"Direct": 0, "Corporate": 100, "Groups": 200}
@@ -137,6 +138,14 @@ def test_train_pipeline_registers_a_promotion_candidate_when_quality_gate_passes
     run = client.get_run(run_id)
     assert run.data.tags.get("quality_gate") == "passed"
     assert "f1_macro" in run.data.metrics
+    # The untuned default is always a candidate, so tuning never loses to it.
+    assert run.data.metrics["val_f1_best"] >= run.data.metrics["val_f1_default"]
+    assert "baseline_f1_macro" in run.data.metrics
+    assert 0.0 <= run.data.metrics["roc_auc_ovr_macro"] <= 1.0
+    confusion = mlflow.artifacts.load_dict(f"runs:/{run_id}/evaluation/confusion_matrix.json")
+    assert sum(map(sum, confusion["matrix"])) > 0
+    # The synthetic frame covers a single arrival year: nothing to hold out.
+    assert "temporal_f1_score" not in run.data.metrics
 
     # The processed frame carries distribution_channel / reservation_status;
     # the model must have been trained on the allowlist only.
@@ -171,3 +180,25 @@ def test_train_pipeline_fails_quality_gate_without_promoting(base_config, monkey
     assert len(versions) == 1
     with pytest.raises(MlflowException):
         client.get_model_version_by_alias(registry_name, registry_alias)
+
+
+def test_temporal_backtest_holds_out_the_last_year() -> None:
+    frame = pd.concat(
+        [_make_processed_df().assign(arrival_date_year=year) for year in (2015, 2016, 2017)],
+        ignore_index=True,
+    )
+    spec = FeatureSpec.from_config(load_config())
+
+    result = temporal_backtest(frame, spec, {"n_estimators": 10}, 0, "market_segment")
+
+    assert result is not None
+    assert result["train_years"] == [2015, 2016]
+    assert result["holdout_year"] == 2017
+    assert result["n_test"] == len(frame) // 3
+    assert 0.0 <= result["f1_macro"] <= 1.0
+
+
+def test_temporal_backtest_skips_a_single_year() -> None:
+    spec = FeatureSpec.from_config(load_config())
+
+    assert temporal_backtest(_make_processed_df(), spec, {}, 0, "market_segment") is None

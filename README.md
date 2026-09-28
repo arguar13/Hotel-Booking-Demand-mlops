@@ -214,15 +214,38 @@ year boundary is continuous. All derived features are computed inside the
 logged scikit-learn pipeline, so the API sends raw booking fields and cannot
 diverge from training.
 
-Class imbalance is handled by `class_weight="balanced_subsample"` alone.
-SMOTE was removed: it interpolated between one-hot rows (fractional
-countries), slowed every trial, and would double-correct combined with class
-weights.
+Class imbalance is handled by `class_weight="balanced_subsample"` alone, with
+no resampling: oversampling methods such as SMOTE interpolate between
+one-hot-encoded rows (producing fractional categories), and combining them
+with class weights would correct the imbalance twice.
 
-With the leaky columns in, a RandomForest scored ~0.93 weighted F1 - mostly a
-lookup of `distribution_channel`/`agent`. On booking-time features only, the
-full-dataset run scores **weighted F1 ~0.81, macro F1 ~0.74** on the
-held-out test split. That lower number is the honest one.
+## How the model is evaluated
+
+- **Three-way stratified split (60/20/20).** Optuna scores candidates on the
+  validation split only; the test split is used once, for the final numbers.
+- **The untuned model is always a candidate.** Trial 0 is scikit-learn's
+  default RandomForest, so tuning can only replace it with a configuration
+  that scores better on validation (`val_f1_default` vs `val_f1_best`).
+- **A naive baseline travels with every run.** Always predicting the most
+  frequent segment scores 0.59 accuracy but 0.106 macro F1 - which is why
+  accuracy is not the headline metric here (`baseline_f1_*`).
+- **Weighted and macro F1**, a per-class report, the confusion matrix and a
+  one-vs-rest ROC AUC per segment are logged to MLflow on every run.
+- **Temporal backtest.** The chosen configuration is refit on 2015-2016 and
+  scored on 2017 (`temporal_f1_*`): the estimate for bookings the model has
+  never seen, after the channel mix has moved.
+
+Full-dataset run (`n_trials_optuna: 8`):
+
+| | Weighted F1 | Macro F1 |
+|---|---|---|
+| Most-frequent baseline (test) | 0.439 | 0.106 |
+| Validation: default -> tuned | 0.844 -> 0.855 | - |
+| **Test split (random, stratified)** | **0.866** | **0.834** |
+| **2017, trained on 2015-2016** | **0.765** | **0.617** |
+
+The gap between the last two rows is the reason the drift check below
+exists.
 
 ## Promoting a model to champion
 
