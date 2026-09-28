@@ -75,6 +75,16 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 20
 ---
+# ClusterIP, not LoadBalancer: the MLflow server has no authentication, and
+# anyone who can reach it can read every run and move the registry alias the
+# API serves from. Its only consumers are inside the cluster (api, the
+# drift-check CronJob) or an operator who already holds cluster credentials:
+#
+#   kubectl port-forward -n hotel-mlops svc/mlflow-service 5000:5000
+#   # UI: http://localhost:5000, or MLFLOW_TRACKING_URI=http://localhost:5000
+#
+# localhost:5000 is already on MLFLOW_ALLOWED_HOSTS, so no ELB hostname has to
+# be discovered and added after every re-deploy either.
 apiVersion: v1
 kind: Service
 metadata:
@@ -86,7 +96,7 @@ spec:
   ports:
     - port: 5000
       targetPort: 5000
-  type: LoadBalancer
+  type: ClusterIP
 ---
 # mlflow server itself is stateless - state lives in Postgres and S3 - so two
 # replicas behind the same Service is a supported HA pattern with no

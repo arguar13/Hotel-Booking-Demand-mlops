@@ -322,6 +322,17 @@ El stage `deploy` de `.gitlab-ci.yml` corre el mismo comando después de
 construir y publicar imágenes nuevas, así que el estado del cluster siempre
 refleja la última ejecución exitosa del pipeline sobre `main`.
 
+La API y el dashboard tienen load balancers públicos. MLflow no: no tiene
+autenticación, y cualquiera que pueda alcanzarlo puede mover el alias del
+registro desde el que sirve la API, así que `mlflow-service` es `ClusterIP`.
+Se accede a través de la API de EKS con tus credenciales del cluster:
+
+```bash
+kubectl port-forward -n hotel-mlops svc/mlflow-service 5000:5000
+# UI en http://localhost:5000; para entrenar/promover:
+MLFLOW_TRACKING_URI=http://localhost:5000 make train promote
+```
+
 ## Testing y calidad
 
 ```bash

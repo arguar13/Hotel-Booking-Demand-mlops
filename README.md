@@ -306,6 +306,17 @@ kubectl apply -k kubernetes/overlays/production
 pushing fresh images, so the cluster's state always reflects the last
 successful pipeline run on `main`.
 
+The API and the dashboard get public load balancers. MLflow does not: it has
+no authentication, and anyone who can reach it can move the registry alias
+the API serves from, so `mlflow-service` is `ClusterIP`. Reach it through
+the EKS API with your cluster credentials:
+
+```bash
+kubectl port-forward -n hotel-mlops svc/mlflow-service 5000:5000
+# UI at http://localhost:5000; for training/promotion:
+MLFLOW_TRACKING_URI=http://localhost:5000 make train promote
+```
+
 ## Testing and quality
 
 ```bash
