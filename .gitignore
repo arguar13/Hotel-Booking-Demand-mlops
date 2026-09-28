@@ -63,10 +63,17 @@ crash.*.log
 .DS_Store
 creds.json
 creds.sh
-creds.json
-creds.sh
 mlflow.db
 mlruns/
+mlartifacts/
+
+# Written by `python -m src.train` for `make promote` - a local hand-off, not source.
+run_id.txt
+
+# Personal study/execution guides for this project - kept on this machine,
+# never published with the repository.
+Guia completa del proyecto*/
+GUIA_EJECUCION_PROYECTO*.docx
 
 # Office/Word lock files - created whenever a .docx in the repo is open
 ~$*
