@@ -20,6 +20,60 @@ data:
   # actually happened, rather than against injected noise.
   train_max_year: null
 
+# The model's input contract: an allowlist, not "every column except the
+# target". A column only belongs here if it is known *at the moment a booking
+# is created*, which is when the segment is needed (pricing, demand
+# forecasting). tests/test_features.py fails if a column listed under
+# "Deliberately excluded" below ever gets added back.
+#
+# Deliberately excluded:
+#   - distribution_channel: recorded by the same channel-of-record system as
+#     market_segment and almost a coarser copy of it (Direct->Direct,
+#     Corporate->Corporate, TA/TO->the TA segments). It alone predicts the
+#     segment for ~77% of bookings, so a model using it mostly learns a lookup.
+#   - agent, company (the raw ids): identifiers, not quantities - a median or
+#     a mean of them means nothing, and a single agent id pins the segment for
+#     ~89% of bookings. Only their presence is used (presence_flags below).
+#   - reservation_status, reservation_status_date, is_canceled: outcomes of
+#     the booking, only known after it happened (target leakage).
+#   - assigned_room_type, booking_changes: set or accumulated after booking
+#     time, up to check-in.
+#   - arrival_date_year: the model is always applied to years it never saw,
+#     so this can only extrapolate. Still used to cut the training period.
+features:
+  numeric:
+    - lead_time
+    - arrival_date_day_of_month
+    - stays_in_weekend_nights
+    - stays_in_week_nights
+    - adults
+    - children
+    - babies
+    - is_repeated_guest
+    - previous_cancellations
+    - previous_bookings_not_canceled
+    - days_in_waiting_list
+    - adr
+    - required_car_parking_spaces
+    - total_of_special_requests
+  # Encoded as sin/cos inside the model pipeline (src/features.py), so week 53
+  # sits next to week 1 and December next to January.
+  cyclical:
+    month: 12
+    arrival_date_week_number: 53
+  # NaN means "booked without a travel agent / company", which is exactly the
+  # information worth keeping: becomes has_agent / has_company.
+  presence_flags:
+    - agent
+    - company
+  categorical:
+    - hotel
+    - meal
+    - country
+    - reserved_room_type
+    - deposit_type
+    - customer_type
+
 model:
   target_column: "market_segment"
   # Three-way split, not two-way: Optuna tunes against validation_size only.
@@ -30,7 +84,10 @@ model:
   test_size: 0.2
   validation_size: 0.2
   random_state: 42
-  n_trials_optuna: 2
+  # Each trial fits a RandomForest on ~50k rows (roughly a minute on a
+  # laptop). Raise it for a real tuning run; the sampler is seeded with
+  # random_state, so the same value always explores the same trials.
+  n_trials_optuna: 5
   # Quality gate: a trained model version is only ever a promotion
   # *candidate* when its weighted F1 on the held-out test split meets this
   # bar. A run that misses it is still logged to MLflow for audit, but the
@@ -65,7 +122,9 @@ model:
 
 mlflow:
   experiment_name: "hotel_market_segmentation"
-  tracking_uri: "http://localhost:5000"
+  # The host port docker-compose publishes MLflow on (5050, not 5000 - see
+  # docker-compose.yml). MLFLOW_TRACKING_URI overrides it in every entrypoint.
+  tracking_uri: "http://localhost:5050"
 
 # Drift monitoring. Read by the CronJob in kubernetes/base/drift-monitor-cronjob.yaml
 # (src/monitoring/drift_check.py), never by the API. See that module's

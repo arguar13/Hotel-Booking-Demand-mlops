@@ -9,17 +9,32 @@ from src.data_processing import load_and_clean_data
 BASE_ROW = {
     "hotel": "City Hotel",
     "market_segment": "Direct",
+    "arrival_date_year": 2016,
     "arrival_date_month": "July",
     "arrival_date_week_number": 27,
     "arrival_date_day_of_month": 1,
     "lead_time": 1,
+    "stays_in_weekend_nights": 1,
+    "stays_in_week_nights": 2,
     "adults": 2,
     "babies": 0,
     "children": 0.0,
+    "meal": "BB",
+    "country": "PRT",
+    "is_repeated_guest": 0,
+    "previous_cancellations": 0,
+    "previous_bookings_not_canceled": 0,
+    "reserved_room_type": "A",
+    "deposit_type": "No Deposit",
+    "customer_type": "Transient",
     "adr": 100.0,
     "booking_changes": 0,
     "days_in_waiting_list": 0,
+    "required_car_parking_spaces": 0,
     "total_of_special_requests": 0,
+    # NaN = no agent / company, the way the source data encodes it
+    "agent": 9.0,
+    "company": float("nan"),
 }
 
 

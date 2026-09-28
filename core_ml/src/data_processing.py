@@ -83,7 +83,7 @@ def load_and_clean_data(filepath: str, min_class_count: int) -> pd.DataFrame:
             df["month"] = df["arrival_date_month"].map(month_map)
             df = df.drop(columns=["arrival_date_month"])
 
-        # Fail fast: reject the cleaned output before it reaches Optuna/SMOTE/training.
+        # Fail fast: reject the cleaned output before it reaches Optuna/training.
         df = validate_processed(df)
 
         logger.info(f"Data loaded and cleaned successfully. Final shape: {df.shape}")

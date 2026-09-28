@@ -1,54 +1,33 @@
-import logging
 import os
-import sys
 import tempfile
 from pathlib import Path
 
+import cloudpickle
 import mlflow
 import mlflow.sklearn
 import optuna
 import pandas as pd
 import structlog
-from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline
 from mlflow.tracking import MlflowClient
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
+from src import features as features_module
 from src.config_loader import load_config
-from src.data_contracts import validate_processed
+from src.data_contracts import DataContractError, validate_processed
 from src.data_processing import use_toy_data
+from src.features import FeatureSpec, build_model_pipeline
+from src.logging_setup import configure_logging
 from src.monitoring.drift_check import PerformanceBaseline, build_reference_profile
 from src.traceability import collect_traceability_tags
 
-# MLflow >=3 prints run/model links decorated with emoji. A Windows console
-# defaults to cp1252, which cannot encode them, so the process dies with
-# UnicodeEncodeError *after* the model has been trained and registered - a
-# non-zero exit for a run that actually succeeded. Force UTF-8 on the
-# standard streams; a no-op on Linux and in CI, where they already are.
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+# The pipeline contains BookingFeatureBuilder, a class from this package. The
+# API image does not ship core_ml's code, so pickling that class *by
+# reference* (the default for importable modules) would make the model
+# unloadable there with "No module named 'src'". Pickling this one module by
+# value embeds the class in the artifact instead.
+cloudpickle.register_pickle_by_value(features_module)
 
-# Same structured-JSON approach as api/main.py: one log line per event, as a
-# JSON object, ready for CloudWatch/Elasticsearch - not prose meant for a
-# human tailing a terminal.
-structlog.configure(
-    processors=[
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.add_log_level,
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
 log = structlog.get_logger("hotel_mlops.train")
 
 
@@ -93,7 +72,7 @@ def train_pipeline() -> str:
         processed_path = config["data"]["processed_data_path"]
 
     # Load data - fail fast if it doesn't satisfy the processed data contract,
-    # before spending any compute on Optuna/SMOTE/model fitting.
+    # before spending any compute on Optuna/model fitting.
     df = pd.read_csv(processed_path)
     df = validate_processed(df)
 
@@ -114,8 +93,16 @@ def train_pipeline() -> str:
         )
         df = validate_processed(df)
 
-    X = df.drop(columns=[config["model"]["target_column"]])
+    # Only the allowlisted input columns, never "everything but the target":
+    # see config.yaml's `features:` block for what is excluded and why.
+    spec = FeatureSpec.from_config(config)
+    missing = [c for c in spec.input_columns if c not in df.columns]
+    if missing:
+        raise DataContractError(f"processed dataset is missing model input column(s): {missing}")
+
+    X = df[spec.input_columns]
     y = df[config["model"]["target_column"]]
+    random_state = config["model"]["random_state"]
 
     # Three-way split. Optuna's objective below is scored on X_val only - never
     # on X_test - because a hyperparameter search that gets to see the test set
@@ -144,55 +131,22 @@ def train_pipeline() -> str:
         stratify=y_holdout,
     )
 
-    # Preprocessing definitions
-    numeric_features = X.select_dtypes(include=["int64", "float64"]).columns
-    categorical_features = X.select_dtypes(include=["object"]).columns
-
-    # Numerical pipeline: Impute missing values with median, then scale
-    num_pipeline = Pipeline(
-        steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
-    )
-
-    # Categorical pipeline: Impute missing values with most frequent, then one-hot encode
-    cat_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("encoder", OneHotEncoder(handle_unknown="ignore")),
-        ]
-    )
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", num_pipeline, numeric_features),
-            ("cat", cat_pipeline, categorical_features),
-        ]
-    )
-
-    def objective(trial):
-        n_estimators = trial.suggest_int("n_estimators", 50, 200)
-        max_depth = trial.suggest_int("max_depth", 5, 20)
-
-        model = RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            random_state=config["model"]["random_state"],
-        )
-
-        pipeline = Pipeline(
-            steps=[
-                ("preprocessor", preprocessor),
-                ("smote", SMOTE(random_state=config["model"]["random_state"])),
-                ("classifier", model),
-            ]
-        )
-
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 50, 200),
+            "max_depth": trial.suggest_int("max_depth", 8, 25),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 5),
+        }
+        pipeline = build_model_pipeline(spec, params, random_state)
         pipeline.fit(X_train, y_train)
-        preds = pipeline.predict(X_val)
-
-        return f1_score(y_val, preds, average="weighted")
+        return float(f1_score(y_val, pipeline.predict(X_val), average="weighted"))
 
     log.info("optuna_tuning_started", n_trials=config["model"]["n_trials_optuna"])
-    study = optuna.create_study(direction="maximize")
+    # Seeded sampler: the same config explores the same trials, so two runs on
+    # the same data and commit produce the same model.
+    study = optuna.create_study(
+        direction="maximize", sampler=optuna.samplers.TPESampler(seed=random_state)
+    )
     study.optimize(objective, n_trials=config["model"]["n_trials_optuna"])
 
     best_params = study.best_params
@@ -203,20 +157,18 @@ def train_pipeline() -> str:
         mlflow.log_params(best_params)
         mlflow.set_tags(collect_traceability_tags(processed_path))
         mlflow.set_tag("used_toy_data", str(use_toy_data()))
-
-        final_model = RandomForestClassifier(
-            n_estimators=best_params["n_estimators"],
-            max_depth=best_params["max_depth"],
-            random_state=config["model"]["random_state"],
+        mlflow.log_dict(
+            {
+                "input_columns": spec.input_columns,
+                "numeric": spec.numeric,
+                "cyclical": spec.cyclical,
+                "presence_flags": spec.presence_flags,
+                "categorical": spec.categorical,
+            },
+            "features/feature_spec.json",
         )
 
-        final_pipeline = Pipeline(
-            steps=[
-                ("preprocessor", preprocessor),
-                ("smote", SMOTE(random_state=config["model"]["random_state"])),
-                ("classifier", final_model),
-            ]
-        )
+        final_pipeline = build_model_pipeline(spec, best_params, random_state)
 
         # Refit on train+val: validation's job (selecting best_params) is done,
         # so folding it back into the fit gives the shipped model more signal
@@ -226,12 +178,22 @@ def train_pipeline() -> str:
         final_pipeline.fit(X_fit, y_fit)
         y_pred = final_pipeline.predict(X_test)
 
-        # Metrics
+        # Metrics. Weighted F1 drives the quality gate and promotion; macro F1
+        # is logged next to it because the weighted average is dominated by
+        # Online TA (~half the rows) and hides a model that gives up on the
+        # small segments (Aviation, Complementary). The per-class report is
+        # where to look when the two diverge.
         f1 = f1_score(y_test, y_pred, average="weighted")
+        f1_macro = f1_score(y_test, y_pred, average="macro")
         acc = accuracy_score(y_test, y_pred)
 
         mlflow.log_metric("f1_score", f1)
+        mlflow.log_metric("f1_macro", f1_macro)
         mlflow.log_metric("accuracy", acc)
+        mlflow.log_dict(
+            classification_report(y_test, y_pred, output_dict=True, zero_division=0),
+            "evaluation/classification_report.json",
+        )
 
         # --- Monitoring baseline -------------------------------------------
         # Drift is a comparison, so a model is only monitorable if the
@@ -245,9 +207,11 @@ def train_pipeline() -> str:
         #
         # Built from X_fit (train+val), not the full frame: the reference for
         # "what did this model learn from" is exactly the rows it was fitted
-        # on, which is train+val now that val has been folded back in.
+        # on, which is train+val now that val has been folded back in. Only
+        # the raw numeric inputs the API receives - an identifier's mean
+        # (agent, company) is not a distribution worth testing.
         reference_profile = build_reference_profile(
-            features=X_fit,
+            features=X_fit[spec.monitored_numeric_columns],
             performance=PerformanceBaseline(
                 f1_weighted=float(f1),
                 accuracy=float(acc),
@@ -270,13 +234,13 @@ def train_pipeline() -> str:
         registry_name = config["model"]["registry_name"]
         mlflow.sklearn.log_model(
             sk_model=final_pipeline,
-            artifact_path="model",
+            name="model",
             registered_model_name=registry_name,
             serialization_format="cloudpickle",
         )
 
         run_id = run.info.run_id
-        log.info("run_logged", run_id=run_id, f1_score=f1, accuracy=acc)
+        log.info("run_logged", run_id=run_id, f1_score=f1, f1_macro=f1_macro, accuracy=acc)
 
         # Quality gate: an absolute floor a version must clear to even be
         # *considered* for promotion. A run that fails it is still fully
@@ -312,6 +276,7 @@ def train_pipeline() -> str:
 
 
 if __name__ == "__main__":
+    configure_logging()
     completed_run_id = train_pipeline()
     # structlog is configured above to print JSON lines to this same stdout
     # (PrintLoggerFactory), so the run id cannot just be `print()`-ed without

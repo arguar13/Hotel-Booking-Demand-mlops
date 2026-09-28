@@ -2,20 +2,20 @@
 name = "hotel-mlops-core"
 version = "1.0.0"
 description = "Data Pipeline, Entrenamiento y Monitoreo MLOps"
-authors = ["Tu Nombre <tu@email.com>"]
+authors = ["Armando"]
 packages = [
     {include = "src"},
     {include = "dashboard"}
 ]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.13" #[cite: 27]
+python = ">=3.10,<3.13"
 # Data Science & Machine Learning
-pandas = ">=2.1.1" #[cite: 27]
-numpy = "<2.0.0" # mlflow==2.11.3 pins numpy<2; keep aligned with api/pyproject.toml
-scikit-learn = ">=1.4.0" #[cite: 27]
-imbalanced-learn = "^0.14.0" # <0.14 is incompatible with the resolved scikit-learn>=1.6/1.7
-optuna = "^3.5.0" #[cite: 27]
+pandas = ">=2.1.1"
+numpy = "<2.0.0" # keep aligned with api/pyproject.toml: the API unpickles what this trains
+scikit-learn = ">=1.4.0" # keep aligned with api/pyproject.toml, same reason as numpy
+optuna = "^3.5.0"
+cloudpickle = "^3.1.0" # imported directly by src/train.py (pickle-by-value registration)
 pandera = "^0.20.4"
 scipy = "^1.13.0" # the z-test in src/monitoring/drift_check.py
 structlog = "^26.1.0" # JSON logs (CloudWatch/ELK-friendly), same approach as api/
@@ -42,7 +42,7 @@ requests = "^2.32.0"
 gunicorn = "^22.0.0"  # CVE-2024-1135 / CVE-2024-6827 (request smuggling)
 pillow = "^12.1.1"    # 13 CVEs in 10.4.0 (heap OOB write, several DoS paths)
 pyarrow = "^23.0.1"   # CVE-2026-25087 (use-after-free DoS)
-pydantic = "^2.0.0" # Permitimos la versión moderna para estas herramientas[cite: 27]
+pydantic = "^2.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.3"

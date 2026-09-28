@@ -8,6 +8,7 @@ and proves the pipeline's wiring - not the model's real-world accuracy.
 
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,6 +16,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
 from src import train as train_module
+from src.config_loader import load_config
 from src.train import QualityGateError, train_pipeline
 
 N_PER_CLASS = 20
@@ -30,15 +32,34 @@ def _make_processed_df() -> pd.DataFrame:
                 {
                     "hotel": "City Hotel",
                     "market_segment": segment,
+                    "arrival_date_year": 2016,
                     "month": 7,
+                    "arrival_date_week_number": 27,
+                    "arrival_date_day_of_month": 1,
                     "lead_time": offset + int(rng.integers(0, 10)),
+                    "stays_in_weekend_nights": 1,
+                    "stays_in_week_nights": 2,
                     "adults": 2,
                     "babies": 0,
                     "children": 0.0,
+                    "meal": "BB",
+                    "country": "PRT",
+                    "is_repeated_guest": 0,
+                    "previous_cancellations": 0,
+                    "previous_bookings_not_canceled": 0,
+                    "reserved_room_type": "A",
+                    "deposit_type": "No Deposit",
+                    "customer_type": "Transient",
                     "adr": 100.0,
-                    "booking_changes": 0,
                     "days_in_waiting_list": 0,
+                    "required_car_parking_spaces": 0,
                     "total_of_special_requests": 0,
+                    "agent": 9.0 if segment != "Direct" else float("nan"),
+                    "company": float("nan"),
+                    # Post-booking columns that are present in the processed
+                    # CSV but must never be used as model inputs.
+                    "distribution_channel": segment,
+                    "reservation_status": "Check-Out",
                 }
             )
     return pd.DataFrame(rows)
@@ -68,6 +89,7 @@ def base_config(tmp_path: Path) -> dict:
         "data": {
             "processed_data_path": str(processed_path),
         },
+        "features": load_config()["features"],
         "model": {
             "target_column": "market_segment",
             "test_size": 0.3,
@@ -113,6 +135,13 @@ def test_train_pipeline_registers_a_promotion_candidate_when_quality_gate_passes
 
     run = client.get_run(run_id)
     assert run.data.tags.get("quality_gate") == "passed"
+    assert "f1_macro" in run.data.metrics
+
+    # The processed frame carries distribution_channel / reservation_status;
+    # the model must have been trained on the allowlist only.
+    feature_spec = mlflow.artifacts.load_dict(f"runs:/{run_id}/features/feature_spec.json")
+    assert "distribution_channel" not in feature_spec["input_columns"]
+    assert "reservation_status" not in feature_spec["input_columns"]
 
     with pytest.raises(MlflowException):
         client.get_model_version_by_alias(registry_name, registry_alias)

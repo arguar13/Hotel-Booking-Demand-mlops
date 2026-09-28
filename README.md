@@ -25,8 +25,8 @@ repeatable, reviewable path from a new training run to a production alias
 flip.
 
 This project builds that whole loop end to end: a scikit-learn classifier
-(RandomForest + SMOTE for the class imbalance across segments + Optuna for
-hyperparameter search) trained on the classic
+(a class-weighted RandomForest + Optuna for hyperparameter search, fed only
+what is known at the moment a booking is created) trained on the classic
 [hotel booking demand dataset](https://www.sciencedirect.com/science/article/pii/S2352340918315191),
 served behind a FastAPI endpoint, versioned in an MLflow Model Registry, and
 watched by a scheduled statistical check for data drift — all wired together
@@ -136,7 +136,7 @@ Deployment.
 
 | Layer | Choice |
 |---|---|
-| Model | scikit-learn `RandomForestClassifier`, imbalanced-learn `SMOTE`, Optuna for hyperparameter search |
+| Model | scikit-learn `RandomForestClassifier` (`class_weight="balanced_subsample"`), Optuna (seeded TPE) for hyperparameter search |
 | Data validation | Pandera schemas (`core_ml/src/data_contracts.py`) — fail fast before an expensive training run starts |
 | Data versioning | DVC, backed by the same S3 bucket MLflow uses for artifacts |
 | Experiment tracking / registry | MLflow (server + Model Registry, alias-based) |
@@ -175,16 +175,54 @@ Both `api/` and `core_ml/` are separate Poetry projects.
 ```bash
 cd core_ml
 poetry install
-poetry run dvc pull                       # pulls the tracked dataset
-MLFLOW_TRACKING_URI=http://localhost:5050 poetry run python -m src.train
+poetry run dvc pull                       # pulls the tracked dataset (real S3 remote)
+poetry run python -m src.train            # MLflow at http://localhost:5050 by default
 ```
 
-Training runs a scikit-learn pipeline (SMOTE + a tuned RandomForest) with
-Optuna, logs the run (params, metrics, the model itself, and a small
-reference profile used later for drift checking) to MLflow, and writes the
-run id to `core_ml/run_id.txt`. A run that doesn't clear
+`dvc pull` talks to the real AWS S3 remote. To stay fully local, copy the
+public [hotel booking demand](https://www.sciencedirect.com/science/article/pii/S2352340918315191)
+CSV to `core_ml/data/hotel_bookings.csv` instead and check that its
+`md5sum` matches the hash in `core_ml/data/hotel_bookings.csv.dvc`
+(`5bf588c5...`) - DVC then treats it exactly like a pulled copy.
+`make train-toy` runs the same loop on a 1,000-row sample in seconds.
+
+Training runs a scikit-learn pipeline (feature derivation + a tuned,
+class-weighted RandomForest) with Optuna, logs the run (params, weighted and
+macro F1, a per-class report, the feature list, the model itself, and a
+small reference profile used later for drift checking) to MLflow, and writes
+the run id to `core_ml/run_id.txt`. A run that doesn't clear
 `model.min_f1_threshold` (see `core_ml/config/config.yaml`) is still logged
 for audit but is never eligible for promotion.
+
+## What the model is allowed to see
+
+The segment is needed when a booking is created (pricing, demand
+forecasting), so the model only receives columns known at that moment. The
+allowlist lives in `core_ml/config/config.yaml` (`features:`), and
+`core_ml/tests/test_features.py` fails if an excluded column comes back.
+
+| Excluded | Why |
+|---|---|
+| `distribution_channel` | Recorded with the label and nearly a coarser copy of it - on its own it predicts the segment for ~77% of bookings |
+| `agent`, `company` (raw ids) | Identifiers, not quantities; one agent id pins the segment for ~89% of bookings. Only their *presence* is used (`has_agent`, `has_company`) - NaN means "no agent/company" |
+| `reservation_status`, `reservation_status_date`, `is_canceled` | Outcomes, only known after the booking (target leakage) |
+| `assigned_room_type`, `booking_changes` | Set or accumulated after booking time |
+| `arrival_date_year` | The model is always applied to years it never saw; still used to cut the training period |
+
+`month` and `arrival_date_week_number` are encoded as sin/cos pairs so the
+year boundary is continuous. All derived features are computed inside the
+logged scikit-learn pipeline, so the API sends raw booking fields and cannot
+diverge from training.
+
+Class imbalance is handled by `class_weight="balanced_subsample"` alone.
+SMOTE was removed: it interpolated between one-hot rows (fractional
+countries), slowed every trial, and would double-correct combined with class
+weights.
+
+With the leaky columns in, a RandomForest scored ~0.93 weighted F1 - mostly a
+lookup of `distribution_channel`/`agent`. On booking-time features only, the
+full-dataset run scores **weighted F1 ~0.81, macro F1 ~0.74** on the
+held-out test split. That lower number is the honest one.
 
 ## Promoting a model to champion
 

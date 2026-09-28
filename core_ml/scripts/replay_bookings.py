@@ -42,11 +42,12 @@ from src.data_processing import load_and_clean_data  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("replay")
 
-# Columns the API's Pydantic schema accepts. Anything else in the processed
-# frame (the target itself, engineered leftovers) is dropped rather than sent:
-# posting the true segment alongside the features would make the prediction
-# meaningless and the resulting "no drift" verdict a lie.
+# The target is dropped rather than sent: posting the true segment alongside
+# the features would make the prediction meaningless and the resulting
+# "no drift" verdict a lie. Other columns outside the API's schema (e.g.
+# reservation_status) are ignored by the API and never reach the model.
 TARGET_COLUMN = "market_segment"
+NULLABLE_ID_COLUMNS = {"agent", "company"}
 
 
 def _payload(row: pd.Series, text_columns: set[str]) -> dict:
@@ -61,7 +62,11 @@ def _payload(row: pd.Series, text_columns: set[str]) -> dict:
     record = row.drop(labels=[TARGET_COLUMN], errors="ignore").to_dict()
     cleaned: dict = {}
     for key, value in record.items():
-        if pd.isna(value):
+        if pd.isna(value) and key in NULLABLE_ID_COLUMNS:
+            # "No agent / no company" is information, not a gap to fill: send
+            # null so the model sees has_agent=0, exactly as in training.
+            cleaned[key] = None
+        elif pd.isna(value):
             cleaned[key] = "Unknown" if key in text_columns else 0.0
         elif isinstance(value, (int, float)) and float(value).is_integer():
             cleaned[key] = int(value)

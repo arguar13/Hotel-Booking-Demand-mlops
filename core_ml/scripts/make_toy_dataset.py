@@ -4,7 +4,7 @@ fast end-to-end local runs (`make data-toy` / `make train-toy`).
 The sample is stratified per market_segment class (capped at an even quota
 per class) rather than proportional to the real class distribution, so that
 every class surviving `valid_classes_min_count` still has enough rows for a
-stratified train/test split and for SMOTE to oversample from. The output is
+stratified train/validation/test split. The output is
 tracked with DVC, not committed as a plain file, so it stays reproducible and
 content-addressed just like the full dataset.
 """

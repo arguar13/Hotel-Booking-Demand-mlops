@@ -26,8 +26,8 @@ y auditable desde un nuevo entrenamiento hasta el cambio de alias en
 producción.
 
 Este proyecto construye ese ciclo completo de punta a punta: un clasificador
-de scikit-learn (RandomForest + SMOTE para el desbalance de clases entre
-segmentos + Optuna para la búsqueda de hiperparámetros) entrenado sobre el
+de scikit-learn (RandomForest con pesos por clase + Optuna para la búsqueda de
+hiperparámetros, alimentado solo con lo que se conoce al crear la reserva) entrenado sobre el
 clásico
 [dataset de demanda de reservas hoteleras](https://www.sciencedirect.com/science/article/pii/S2352340918315191),
 servido detrás de un endpoint FastAPI, versionado en un Model Registry de
@@ -145,7 +145,7 @@ entregarle una contraseña a un Deployment.
 
 | Capa | Elección |
 |---|---|
-| Modelo | `RandomForestClassifier` de scikit-learn, `SMOTE` de imbalanced-learn, Optuna para la búsqueda de hiperparámetros |
+| Modelo | `RandomForestClassifier` de scikit-learn (`class_weight="balanced_subsample"`), Optuna (TPE con semilla) para la búsqueda de hiperparámetros |
 | Validación de datos | Esquemas de Pandera (`core_ml/src/data_contracts.py`) — falla rápido antes de empezar un entrenamiento costoso |
 | Versionado de datos | DVC, respaldado por el mismo bucket S3 que usa MLflow para artefactos |
 | Tracking de experimentos / registro | MLflow (servidor + Model Registry, basado en alias) |
@@ -185,16 +185,58 @@ registre un modelo — ver la siguiente sección.
 ```bash
 cd core_ml
 poetry install
-poetry run dvc pull                       # descarga el dataset versionado
-MLFLOW_TRACKING_URI=http://localhost:5050 poetry run python -m src.train
+poetry run dvc pull                       # descarga el dataset versionado (remote S3 real)
+poetry run python -m src.train            # MLflow en http://localhost:5050 por defecto
 ```
 
-El entrenamiento corre un pipeline de scikit-learn (SMOTE + un RandomForest
-ajustado) con Optuna, registra el run (parámetros, métricas, el modelo en sí,
-y un pequeño perfil de referencia usado después para el chequeo de drift) en
-MLflow, y escribe el id del run en `core_ml/run_id.txt`. Un run que no supera
+`dvc pull` habla con el remote S3 real de AWS. Para trabajar 100% en local,
+copiar el CSV público del
+[dataset de demanda hotelera](https://www.sciencedirect.com/science/article/pii/S2352340918315191)
+a `core_ml/data/hotel_bookings.csv` y comprobar que su `md5sum` coincide con
+el hash de `core_ml/data/hotel_bookings.csv.dvc` (`5bf588c5...`): DVC lo trata
+exactamente igual que una copia descargada. `make train-toy` corre el mismo
+ciclo sobre una muestra de 1.000 filas en segundos.
+
+El entrenamiento corre un pipeline de scikit-learn (derivación de features +
+un RandomForest con pesos por clase ajustado con Optuna), registra el run
+(parámetros, F1 ponderado y macro, un reporte por clase, la lista de
+features, el modelo en sí, y un pequeño perfil de referencia usado después
+para el chequeo de drift) en MLflow, y escribe el id del run en
+`core_ml/run_id.txt`. Un run que no supera
 `model.min_f1_threshold` (ver `core_ml/config/config.yaml`) queda igualmente
 registrado para auditoría, pero nunca queda habilitado para promoción.
+
+## Qué puede ver el modelo
+
+El segmento se necesita al crear la reserva (precios, previsión de demanda),
+así que el modelo solo recibe columnas conocidas en ese momento. La lista
+permitida vive en `core_ml/config/config.yaml` (`features:`) y
+`core_ml/tests/test_features.py` falla si una columna excluida vuelve a
+aparecer.
+
+| Excluida | Por qué |
+|---|---|
+| `distribution_channel` | Se registra junto con la etiqueta y es casi una copia más gruesa de ella: por sí sola predice el segmento en ~77% de las reservas |
+| `agent`, `company` (ids) | Son identificadores, no cantidades; un solo id de agente fija el segmento en ~89% de las reservas. Solo se usa su *presencia* (`has_agent`, `has_company`): NaN significa "sin agente/empresa" |
+| `reservation_status`, `reservation_status_date`, `is_canceled` | Resultados que solo se conocen después de la reserva (fuga del target) |
+| `assigned_room_type`, `booking_changes` | Se fijan o acumulan después del momento de la reserva |
+| `arrival_date_year` | El modelo siempre se aplica a años que nunca vio; se sigue usando para acotar el período de entrenamiento |
+
+`month` y `arrival_date_week_number` se codifican como pares seno/coseno
+para que el cambio de año sea continuo. Todas las features derivadas se
+calculan dentro del pipeline de scikit-learn registrado, así que la API envía
+los campos crudos de la reserva y no puede divergir del entrenamiento.
+
+El desbalance de clases se corrige solo con
+`class_weight="balanced_subsample"`. Se quitó SMOTE: interpolaba entre filas
+one-hot (países fraccionarios), hacía cada trial más lento y, combinado con
+pesos por clase, corregía el desbalance dos veces.
+
+Con las columnas con fuga, un RandomForest llegaba a ~0,93 de F1 ponderado,
+en buena parte por buscar `distribution_channel`/`agent`. Solo con features
+disponibles al reservar, el entrenamiento sobre el dataset completo obtiene
+**F1 ponderado ~0,81 y F1 macro ~0,74** en el split de test reservado. Esa
+cifra más baja es la honesta.
 
 ## Promover un modelo a campeón
 
