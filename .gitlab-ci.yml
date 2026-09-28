@@ -120,7 +120,10 @@ train:
   image: python:3.12-slim
   <<: *aws_auth
   script:
-    - apt-get update && apt-get install -y --no-install-recommends make curl
+    - apt-get update && apt-get install -y --no-install-recommends make curl unzip
+    # Same pinned aws-cli / kubectl installs as the `deploy` job.
+    - curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip && unzip -q awscliv2.zip && ./aws/install
+    - curl -sL "https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl" -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
     - curl -sSL https://install.python-poetry.org | python3 -
     - export PATH="/root/.local/bin:$PATH"
     - poetry -C core_ml install --no-interaction
@@ -129,9 +132,18 @@ train:
     # A fresh runner has no dataset: `dvc repro` (inside `make train`) only
     # rebuilds outputs from inputs it can already see.
     - poetry -C core_ml run dvc pull data/hotel_bookings.csv
-    # config.yaml's tracking_uri is the local docker-compose one; the real
-    # server must come from a CI/CD variable, or training would try localhost.
-    - test -n "$MLFLOW_TRACKING_URI" || (echo "MLFLOW_TRACKING_URI CI/CD variable is not set" && exit 1)
+    # mlflow-service is ClusterIP (no unauthenticated public endpoint), so the
+    # runner reaches it the way an operator does: a port-forward through the
+    # EKS API, authorised by this job's OIDC role.
+    - aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+    - kubectl port-forward -n hotel-mlops svc/mlflow-service 5000:5000 > /tmp/port-forward.log 2>&1 &
+    - |
+      for i in $(seq 1 30); do
+        curl -sf http://localhost:5000/health >/dev/null && break
+        sleep 1
+      done
+      curl -sf http://localhost:5000/health >/dev/null || (cat /tmp/port-forward.log && echo "MLflow port-forward never came up" && exit 1)
+    - export MLFLOW_TRACKING_URI=http://localhost:5000
     - make train
     - make promote
   rules:
