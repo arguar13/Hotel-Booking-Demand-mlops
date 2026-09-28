@@ -126,6 +126,12 @@ train:
     - poetry -C core_ml install --no-interaction
     - export AWS_ACCOUNT_ID=$(poetry -C core_ml run python -c "import boto3; print(boto3.client('sts').get_caller_identity()['Account'])")
     - poetry -C core_ml run dvc remote modify s3remote url "s3://hotel-mlops-artifacts-production-${AWS_ACCOUNT_ID}/dvc-store"
+    # A fresh runner has no dataset: `dvc repro` (inside `make train`) only
+    # rebuilds outputs from inputs it can already see.
+    - poetry -C core_ml run dvc pull data/hotel_bookings.csv
+    # config.yaml's tracking_uri is the local docker-compose one; the real
+    # server must come from a CI/CD variable, or training would try localhost.
+    - test -n "$MLFLOW_TRACKING_URI" || (echo "MLFLOW_TRACKING_URI CI/CD variable is not set" && exit 1)
     - make train
     - make promote
   rules:

@@ -12,7 +12,7 @@ PROJECTS := api core_ml
 .PHONY: help install format lint typecheck test test-api test-core-ml \
         precommit precommit-install clean up down data-toy dvc-repro \
         dvc-pull dvc-push train train-toy drift-check replay replay-drift \
-        promote docker-build docker-push deploy tf-fmt tf-validate tf-plan tf-apply
+        promote docker-build docker-push deploy k8s-build tf-fmt tf-validate tf-plan tf-apply
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -73,13 +73,14 @@ data-toy: ## Regenerate the ~1000-row DVC-tracked toy dataset from the raw CSV
 dvc-repro: ## Re-run the DVC data-cleaning pipeline (full + toy), refreshing dvc.lock
 	poetry -C core_ml run dvc repro
 
-dvc-pull: ## Pull DVC-tracked datasets from the S3 remote
+dvc-pull: ## Pull DVC-tracked datasets from the S3 remote (real AWS - see README for the local-copy alternative)
 	poetry -C core_ml run dvc pull
 
-dvc-push: ## Push DVC-tracked datasets to the S3 remote
+dvc-push: ## Push DVC-tracked datasets to the S3 remote (real AWS)
 	poetry -C core_ml run dvc push
 
-train: dvc-repro ## Train on the full dataset (needs a reachable MLflow server, e.g. `make up`)
+train: ## Train on the full dataset (needs a reachable MLflow server, e.g. `make up`)
+	poetry -C core_ml run dvc repro clean_data
 	poetry -C core_ml run python -m src.train
 
 train-toy: ## Fast (~seconds) end-to-end training run against the toy dataset

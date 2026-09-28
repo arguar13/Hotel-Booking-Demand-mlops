@@ -26,6 +26,7 @@ and moves the alias back exactly one step.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 import mlflow
@@ -34,6 +35,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
 from src.config_loader import load_config
+from src.logging_setup import configure_logging
 from src.monitoring.drift_check import load_reference_profile
 
 log = structlog.get_logger("hotel_mlops.promote_model")
@@ -41,6 +43,16 @@ log = structlog.get_logger("hotel_mlops.promote_model")
 
 class PromotionError(Exception):
     """A candidate exists but was rejected, or there is nothing to roll back to."""
+
+
+def _tracking_uri(config: dict) -> str:
+    """Same precedence as train.py and drift_check.py: the env var wins.
+
+    Without it, `MLFLOW_TRACKING_URI=... python -m src.train` followed by a
+    plain `python -m src.promote_model` would train against one server and
+    then look for the run on another.
+    """
+    return os.getenv("MLFLOW_TRACKING_URI", config["mlflow"]["tracking_uri"])
 
 
 def _f1_for_run(run_id: str) -> float:
@@ -84,7 +96,7 @@ def promote(run_id: str, config: dict | None = None) -> str:
     """
     config = config or load_config()
     model_config = config["model"]
-    mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+    mlflow.set_tracking_uri(_tracking_uri(config))
     client = MlflowClient()
 
     run = client.get_run(run_id)
@@ -111,6 +123,19 @@ def promote(run_id: str, config: dict | None = None) -> str:
             reason="no version currently aliased - nothing to compare against",
         )
         _promote_version(client, registry_name, registry_alias, candidate.version, None)
+        return str(candidate.version)
+
+    if str(champion.version) == str(candidate.version):
+        # Re-running promotion for the version already serving (a retried CI
+        # job, a double `make promote`) must be a no-op. Going through the
+        # normal path would tag it promoted_from_version=<itself>, and the
+        # next --rollback would then "roll back" onto the same version.
+        log.info(
+            "promotion_noop",
+            registry_name=registry_name,
+            version=candidate.version,
+            reason=f"already aliased '{registry_alias}'",
+        )
         return str(candidate.version)
 
     if champion.run_id is None:
@@ -160,7 +185,7 @@ def rollback(config: dict | None = None) -> str:
     """Move the alias back exactly one promotion, using the lineage promote() recorded."""
     config = config or load_config()
     model_config = config["model"]
-    mlflow.set_tracking_uri(config["mlflow"]["tracking_uri"])
+    mlflow.set_tracking_uri(_tracking_uri(config))
     client = MlflowClient()
 
     registry_name = model_config["registry_name"]
@@ -187,6 +212,7 @@ def rollback(config: dict | None = None) -> str:
 
 
 def main() -> int:
+    configure_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", help="MLflow run id of the candidate to promote")
     parser.add_argument(

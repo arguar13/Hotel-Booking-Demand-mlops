@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    POETRY_VERSION=1.8.2
+    POETRY_VERSION=2.4.1
 
 WORKDIR /app
 ENV PYTHONPATH="/app/api:${PYTHONPATH}"
@@ -24,11 +24,12 @@ ENV PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
-RUN pip install poetry==$POETRY_VERSION
+# Same Poetry that wrote poetry.lock: lock-version 2.1 needs Poetry >= 2.
+RUN pip install --no-cache-dir poetry==$POETRY_VERSION
 
 COPY api/pyproject.toml api/poetry.lock* ./
 RUN poetry config virtualenvs.create false \
-    && poetry install --only main --no-interaction --no-ansi
+    && poetry install --only main --no-interaction --no-ansi --no-root
 
 COPY api/ ./api/
 

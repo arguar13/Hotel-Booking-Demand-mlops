@@ -36,7 +36,7 @@ import json
 import os
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,7 @@ from mlflow.tracking import MlflowClient
 from scipy import stats
 
 from src.config_loader import load_config
+from src.logging_setup import configure_logging
 
 log = structlog.get_logger("hotel_mlops.monitoring")
 
@@ -266,19 +267,28 @@ _SELECT_RECENT_PREDICTIONS = f"""
 SELECT features
 FROM {SCHEMA}.predictions
 WHERE predicted_at >= %(window_start)s
+  AND model_version = %(model_version)s
 ORDER BY predicted_at DESC
 LIMIT %(max_rows)s
 """  # nosec B608
 
 
 def fetch_recent_predictions(
-    window_hours: float, max_rows: int, dsn: str | None = None
+    window_hours: float, max_rows: int, model_version: str, dsn: str | None = None
 ) -> pd.DataFrame:
-    """The last `window_hours` of logged predictions, features exploded into columns."""
-    from datetime import timedelta
+    """The last `window_hours` of predictions served by `model_version`.
 
+    Filtered by version because the reference profile belongs to one model
+    version: right after a promotion the window also holds the previous
+    version's traffic, and mixing the two would compare one model's baseline
+    against another model's inputs.
+    """
     window_start = datetime.now(UTC) - timedelta(hours=window_hours)
-    params = {"window_start": window_start, "max_rows": max_rows}
+    params = {
+        "window_start": window_start,
+        "max_rows": max_rows,
+        "model_version": str(model_version),
+    }
 
     with psycopg2.connect(dsn or dsn_from_env()) as conn:
         conn.set_session(readonly=True)
@@ -330,6 +340,7 @@ def run_check(config: dict | None = None) -> DriftCheckResult:
     batch = fetch_recent_predictions(
         window_hours=float(monitoring_config["window_hours"]),
         max_rows=int(monitoring_config["max_rows"]),
+        model_version=str(version.version),
     )
     if len(batch) < min_predictions:
         result = DriftCheckResult(
@@ -369,6 +380,7 @@ def _record_run(result: DriftCheckResult, monitoring_config: dict) -> None:
 
 
 def main() -> int:
+    configure_logging()
     config = load_config()
     result = run_check(config)
 

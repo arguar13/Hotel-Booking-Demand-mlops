@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 # MLflow's own HTTP client already retries with backoff (default 5
@@ -49,12 +51,6 @@ structlog.configure(
 )
 log = structlog.get_logger("hotel_mlops.api")
 
-app = FastAPI(
-    title="Hotel Market Segmentation API",
-    description="MLOps API for multiclass market segment classification",
-    version="1.0.0",
-)
-
 # Global model variable
 model = None
 
@@ -70,7 +66,7 @@ model_version: str | None = None
 # the training quality gate (see core_ml/src/train.py) is aliased, so the API
 # only ever serves a model that cleared the bar. Uses the Model Registry
 # alias API rather than the classic (deprecated) stages API.
-MODEL_NAME = "HotelSegmentClassifier"
+MODEL_NAME = os.getenv("MODEL_REGISTRY_NAME", "HotelSegmentClassifier")
 MODEL_ALIAS = os.getenv("MODEL_REGISTRY_ALIAS", "staging")
 
 # How long to wait between attempts while there is still no model at all.
@@ -110,8 +106,19 @@ def _resolve_model_version() -> str | None:
         return None
 
 
-@app.on_event("startup")
-def load_model():
+def _model_uri(version: str | None) -> str:
+    """Pin the load to a concrete version whenever it is known.
+
+    Loading `@alias` and asking which version it points at are two separate
+    registry calls; a promotion landing between them would record the wrong
+    version for every prediction this replica serves.
+    """
+    if version is not None:
+        return f"models:/{MODEL_NAME}/{version}"
+    return f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
+
+
+def load_model() -> None:
     """
     Loads the model version currently aliased MODEL_ALIAS from the MLflow
     Model Registry. If the registry is unreachable or has no version under
@@ -123,11 +130,12 @@ def load_model():
     tracking_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow-service:5000")
     mlflow.set_tracking_uri(tracking_uri)
 
-    model_uri = f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
+    target_version = _resolve_model_version()
+    model_uri = _model_uri(target_version)
     try:
         log.info("model_load_attempt", model_uri=model_uri)
         model = _load_model_with_retry(model_uri)
-        model_version = _resolve_model_version()
+        model_version = target_version
         log.info("model_load_succeeded", model_uri=model_uri, model_version=model_version)
     except Exception as e:
         log.error(
@@ -138,8 +146,7 @@ def load_model():
         )
 
 
-@app.on_event("startup")
-async def start_model_loader() -> None:
+async def _model_loader_loop() -> None:
     """Keep trying to load the model for as long as there isn't one.
 
     Without this, a single failed startup was permanent. Every rollout restarts
@@ -149,18 +156,14 @@ async def start_model_loader() -> None:
     whole time, so Kubernetes sees a healthy pod and never restarts it. In
     practice that meant every deploy left the API dead until someone noticed.
 
-    The retry loop below also picks up a newly promoted model version without a
-    pod restart, once MODEL_REFRESH_SECONDS is set.
+    Once a model is loaded, the same loop picks up a newly promoted version
+    without a pod restart (when MODEL_REFRESH_SECONDS > 0). It only asks the
+    registry which version the alias points at - a cheap metadata call - and
+    downloads the artifact only when that version actually changed, instead of
+    re-downloading the same model every interval.
     """
-    if model is not None and MODEL_REFRESH_SECONDS <= 0:
-        return
-    asyncio.create_task(_model_loader_loop())
-
-
-async def _model_loader_loop() -> None:
     global model, model_version
 
-    model_uri = f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
     while True:
         if model is None:
             delay = MODEL_RETRY_SECONDS
@@ -169,16 +172,21 @@ async def _model_loader_loop() -> None:
         else:
             return  # loaded, and refreshing is disabled - nothing left to do
         await asyncio.sleep(delay)
+
+        # to_thread: mlflow's client is blocking, and this coroutine shares the
+        # event loop that serves requests.
+        target_version = await asyncio.to_thread(_resolve_model_version)
+        if model is not None and (target_version is None or target_version == model_version):
+            continue
+
+        model_uri = _model_uri(target_version)
         try:
-            # to_thread: mlflow's loader is blocking, and this coroutine shares
-            # the event loop that serves requests.
             loaded = await asyncio.to_thread(_load_model_with_retry, model_uri)
         except Exception as e:
             log.warning("model_load_retry_failed", model_uri=model_uri, error=str(e))
             continue
         was_missing = model is None
-        model = loaded
-        model_version = await asyncio.to_thread(_resolve_model_version)
+        model, model_version = loaded, target_version
         log.info(
             "model_load_succeeded" if was_missing else "model_refreshed",
             model_uri=model_uri,
@@ -186,18 +194,44 @@ async def _model_loader_loop() -> None:
         )
 
 
-@app.on_event("startup")
-async def start_inference_logger() -> None:
-    """Open the prediction-log sink and start draining its queue.
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Startup: load the model, open the prediction-log sink, start both loops.
 
-    Needs no broker, only the RDS instance and credentials this pod already
-    has. It is what makes the drift check possible, and it is the reason a
-    prediction served in the cluster is a durable, joinable record instead of
-    a log line on stdout.
+    The inference sink needs no broker, only the RDS instance and credentials
+    this pod already has. It is what makes the drift check possible, and it is
+    the reason a prediction served in the cluster is a durable, joinable record
+    instead of a log line on stdout.
+
+    Shutdown: flush whatever is still queued before the pod goes away. Best
+    effort within the termination grace period: at-most-once delivery is the
+    deliberate trade (see monitoring.py), so a batch lost to a hard kill is
+    acceptable - but throwing away a full queue on every routine rollout, when
+    draining it costs one bounded write, would not be.
     """
+    await asyncio.to_thread(load_model)
+    background: list[asyncio.Task] = []
+    if model is None or MODEL_REFRESH_SECONDS > 0:
+        background.append(asyncio.create_task(_model_loader_loop()))
+
     await asyncio.to_thread(inference_logger.start)
     if inference_logger.enabled:
-        asyncio.create_task(_inference_log_flush_loop())
+        background.append(asyncio.create_task(_inference_log_flush_loop()))
+
+    try:
+        yield
+    finally:
+        for task in background:
+            task.cancel()
+        await asyncio.to_thread(inference_logger.close)
+
+
+app = FastAPI(
+    title="Hotel Market Segmentation API",
+    description="MLOps API for multiclass market segment classification",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 async def _inference_log_flush_loop() -> None:
@@ -212,18 +246,6 @@ async def _inference_log_flush_loop() -> None:
     while True:
         await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
         await asyncio.to_thread(inference_logger.flush)
-
-
-@app.on_event("shutdown")
-async def stop_inference_logger() -> None:
-    """Flush whatever is still queued before the pod goes away.
-
-    Best effort within the termination grace period: at-most-once delivery is
-    the deliberate trade (see monitoring.py), so a batch lost to a hard kill is
-    acceptable - but throwing away a full queue on every routine rollout, when
-    draining it costs one bounded write, would not be.
-    """
-    await asyncio.to_thread(inference_logger.close)
 
 
 @app.get("/health")
@@ -314,8 +336,12 @@ def predict_segment(features: BookingFeatures):
         input_data = pd.DataFrame([feature_map])
         predicted_segment, confidence, margin = _predict_with_confidence(estimator, input_data)
     except Exception as e:
-        log.error("prediction_failed", error=str(e))
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        # The full error goes to the log; the client gets a generic message
+        # rather than a stack-trace fragment from inside the pipeline. Input
+        # validation already happened in the schema, so reaching this is a
+        # server-side problem (model/schema mismatch), hence 500, not 400.
+        log.error("prediction_failed", error=str(e), model_version=model_version)
+        raise HTTPException(status_code=500, detail="Prediction failed.") from e
 
     prediction_id = new_prediction_id()
 

@@ -52,7 +52,7 @@ def _log_candidate_run(config: dict, f1_weighted: float, quality_gate: str = "pa
         model = DummyClassifier(strategy="constant", constant=0).fit([[0.0]], [0])
         mlflow.sklearn.log_model(
             sk_model=model,
-            artifact_path="model",
+            name="model",
             registered_model_name=config["model"]["registry_name"],
         )
         mlflow.set_tag("quality_gate", quality_gate)
@@ -128,6 +128,21 @@ def test_a_challenger_that_regresses_beyond_tolerance_is_rejected(config: dict) 
 
     run = client.get_run(challenger_run)
     assert run.data.tags.get("canary_verdict") == "rejected"
+
+
+def test_promoting_the_version_already_serving_is_a_noop(config: dict) -> None:
+    first_run = _log_candidate_run(config, f1_weighted=0.70)
+    first_version = promote(first_run, config)
+    second_run = _log_candidate_run(config, f1_weighted=0.80)
+    second_version = promote(second_run, config)
+
+    assert promote(second_run, config) == second_version  # e.g. a retried CI job
+
+    client = MlflowClient(tracking_uri=config["mlflow"]["tracking_uri"])
+    aliased = client.get_model_version_by_alias(REGISTRY_NAME, REGISTRY_ALIAS)
+    # Lineage untouched, so a rollback still goes back to the real predecessor.
+    assert aliased.tags["promoted_from_version"] == first_version
+    assert rollback(config) == first_version
 
 
 def test_a_run_that_never_passed_the_quality_gate_cannot_be_promoted(config: dict) -> None:
